@@ -15,8 +15,10 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
+	"mime/multipart"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,7 +30,7 @@ import (
 
 // Update — входящее обновление Telegram (только нужные поля).
 type Update struct {
-	UpdateID int64    `json:"update_id"`
+	UpdateID int64      `json:"update_id"`
 	Message  *TgMessage `json:"message,omitempty"`
 }
 
@@ -38,6 +40,34 @@ type TgMessage struct {
 	From      *TgUser  `json:"from,omitempty"`
 	Chat      TgChat   `json:"chat"`
 	Text      string   `json:"text,omitempty"`
+	Voice     *TgVoice `json:"voice,omitempty"` // голосовое сообщение (OGG/Opus)
+	Audio     *TgAudio `json:"audio,omitempty"` // аудиофайл (mp3 и пр.)
+}
+
+// TgVoice — голосовое сообщение Telegram (OGG/Opus с кодеком OPUS).
+type TgVoice struct {
+	FileID   string `json:"file_id"`
+	Duration int    `json:"duration,omitempty"`
+	FileSize int64  `json:"file_size,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+}
+
+// TgAudio — музыкальный/аудио файл (напр. mp3-диктовка).
+type TgAudio struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name,omitempty"`
+	Duration int    `json:"duration,omitempty"`
+	FileSize int64  `json:"file_size,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+}
+
+// VoiceAttachment — нормализованный голосовой/аудио вход для раннера.
+type VoiceAttachment struct {
+	FileID   string
+	FileName string // для audio — исходное имя; для voice — "voice.ogg"
+	Kind     string // "voice" | "audio"
+	Duration int
+	Size     int64
 }
 
 // TgUser — автор сообщения.
@@ -62,17 +92,18 @@ type apiResponse struct {
 
 // Bot — long-polling клиент Telegram.
 type Bot struct {
-	token      string
-	apiBase    string
+	token       string
+	apiBase     string
+	fileBase    string // https://api.telegram.org/file/bot<token> — скачивание файлов
 	pollTimeout time.Duration
-	allowed    map[int64]bool
-	admins     map[int64]bool
-	http       *http.Client
-	log        *slog.Logger
+	allowed     map[int64]bool
+	admins      map[int64]bool
+	http        *http.Client
+	log         *slog.Logger
 
-	mu      sync.Mutex
+	mu         sync.Mutex
 	lastUpdate int64
-	running  bool
+	running    bool
 }
 
 // New создаёт бота.
@@ -95,6 +126,7 @@ func New(cfg config.TelegramConfig, log *slog.Logger) *Bot {
 	return &Bot{
 		token:       cfg.Token,
 		apiBase:     cfg.APIBase + "/bot" + cfg.Token,
+		fileBase:    cfg.APIBase + "/file/bot" + cfg.Token,
 		pollTimeout: cfg.PollTimeout.Duration,
 		allowed:     allowed,
 		admins:      admins,
@@ -166,14 +198,18 @@ type errTooManyRequests struct {
 
 func (e *errTooManyRequests) Error() string { return "429: " + e.desc }
 
-// doPost — одна попытка. Возвращает (result, apiDescription, apiCode, err).
+// doPost — одна попытка с JSON-телом.
 func (b *Bot) doPost(ctx context.Context, method string, payload []byte) (json.RawMessage, string, int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		b.apiBase+"/"+method, bytes.NewReader(payload))
+	return b.postRaw(ctx, method, "application/json", bytes.NewReader(payload))
+}
+
+// postRaw — одна попытка с произвольным телом (JSON или multipart).
+func (b *Bot) postRaw(ctx context.Context, method, contentType string, body io.Reader) (json.RawMessage, string, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.apiBase+"/"+method, body)
 	if err != nil {
 		return nil, "", 0, err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentType)
 
 	resp, err := b.http.Do(req)
 	if err != nil {
@@ -234,6 +270,7 @@ func isNetRetryable(err error) bool {
 }
 
 // SendMessage отправляет текст (разбивая длинные на куски по 4000 символов, markdown-safe).
+// Идёт через pollResponse: ретраи на ECONNRESET/429/409 — те же, что у getUpdates.
 func (b *Bot) SendMessage(ctx context.Context, chatID int64, text string) error {
 	for _, chunk := range splitMessage(text, 4000) {
 		payload := map[string]any{
@@ -241,22 +278,158 @@ func (b *Bot) SendMessage(ctx context.Context, chatID int64, text string) error 
 			"text":       chunk,
 			"parse_mode": "Markdown",
 		}
-		// первая попытка с Markdown; при parse-ошибке — повтор без форматирования
-		_, _, _, err := b.doPost(ctx, "sendMessage", mustJSON(payload))
-		if err != nil {
-			payload["parse_mode"] = ""
-			delete(payload, "parse_mode")
-			if _, _, _, err2 := b.doPost(ctx, "sendMessage", mustJSON(payload)); err2 != nil {
-				b.log.Error("tg: sendMessage не удался даже без markdown", "chat", chatID, "err", err2)
-				return err2
-			}
+		if _, err := b.pollResponse(ctx, "sendMessage", payload, 3); err == nil {
+			continue
+		}
+		// не прошло (в т.ч. непарсируемая разметка) — повтор без markdown
+		delete(payload, "parse_mode")
+		if _, err2 := b.pollResponse(ctx, "sendMessage", payload, 3); err2 != nil {
+			b.log.Error("tg: sendMessage не удался даже без markdown", "chat", chatID, "err", err2)
+			return err2
 		}
 	}
 	return nil
 }
 
-// Run — цикл long polling. updatesFn вызывается на каждое текстовое сообщение.
-func (b *Bot) Run(ctx context.Context, updatesFn func(chatID, userID int64, text string, isUpdate bool)) error {
+// GetFile — file_path для скачивания по file_id (Bot API getFile).
+func (b *Bot) GetFile(ctx context.Context, fileID string) (string, error) {
+	raw, err := b.pollResponse(ctx, "getFile", map[string]any{"file_id": fileID}, 3)
+	if err != nil {
+		return "", err
+	}
+	var f struct {
+		FilePath string `json:"file_path"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return "", fmt.Errorf("getFile parse: %w", err)
+	}
+	if f.FilePath == "" {
+		return "", errors.New("getFile: пустой file_path")
+	}
+	return f.FilePath, nil
+}
+
+// DownloadFileBytes скачивает содержимое файла по file_path (с ретраями).
+func (b *Bot) DownloadFileBytes(ctx context.Context, filePath string, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		maxBytes = 20 << 20
+	}
+	// file_path отдаёт сам Telegram, но на всякий случай режем явно кривые.
+	if filePath == "" || strings.Contains(filePath, "..") || strings.Contains(filePath, "://") {
+		return nil, fmt.Errorf("некорректный file_path %q", filePath)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.fileBase+"/"+filePath, nil)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		resp, err := b.http.Do(req)
+		if err != nil {
+			if !isNetRetryable(err) {
+				return nil, err
+			}
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			if resp.StatusCode == 429 {
+				lastErr = fmt.Errorf("file http 429")
+				continue
+			}
+			return nil, fmt.Errorf("file http %d: %s", resp.StatusCode, clip(string(raw), 200))
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err // обрыв соединения посреди файла — ретраим
+			continue
+		}
+		if int64(len(data)) > maxBytes {
+			return nil, fmt.Errorf("файл больше лимита %d КБ", maxBytes/1024)
+		}
+		return data, nil
+	}
+	return nil, lastErr
+}
+
+// DownloadAttachment — getFile + скачивание одним вызовом.
+func (b *Bot) DownloadAttachment(ctx context.Context, att *VoiceAttachment, maxBytes int64) ([]byte, error) {
+	if att == nil || att.FileID == "" {
+		return nil, errors.New("пустое вложение")
+	}
+	fp, err := b.GetFile(ctx, att.FileID)
+	if err != nil {
+		return nil, err
+	}
+	return b.DownloadFileBytes(ctx, fp, maxBytes)
+}
+
+// SendVoice отправляет голосовое сообщение (multipart, OGG/Opus).
+func (b *Bot) SendVoice(ctx context.Context, chatID int64, audio []byte, duration int) error {
+	if len(audio) == 0 {
+		return nil
+	}
+	body := &bytes.Buffer{}
+	w := multipart.NewWriter(body)
+	fw, err := w.CreateFormFile("voice", "voice.ogg")
+	if err != nil {
+		return err
+	}
+	if _, err := fw.Write(audio); err != nil {
+		return err
+	}
+	_ = w.WriteField("chat_id", strconv.FormatInt(chatID, 10))
+	if duration > 0 {
+		_ = w.WriteField("duration", strconv.Itoa(duration))
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	payload := append([]byte(nil), body.Bytes()...) // копия на каждую попытку
+	ct := w.FormDataContentType()
+
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		_, apiDesc, _, err := b.postRaw(ctx, "sendVoice", ct, bytes.NewReader(payload))
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if apiDesc != "" {
+			return err // API-ошибка (4xx) не ретраится
+		}
+	}
+	return lastErr
+}
+
+// SendChatAction — индикатор активности («typing», «record_voice»…), fire-and-forget.
+func (b *Bot) SendChatAction(ctx context.Context, chatID int64, action string) {
+	payload := map[string]any{"chat_id": chatID, "action": action}
+	if _, _, _, err := b.doPost(ctx, "sendChatAction", mustJSON(payload)); err != nil {
+		b.log.Debug("tg: sendChatAction не прошёл", "err", err)
+	}
+}
+
+// Run — цикл long polling. updatesFn вызывается на каждое сообщение
+// (текстовое — с text, голосовое/аудио — с att).
+func (b *Bot) Run(ctx context.Context, updatesFn func(chatID, userID int64, text string, att *VoiceAttachment)) error {
 	b.mu.Lock()
 	if b.running {
 		b.mu.Unlock()
@@ -303,10 +476,10 @@ func (b *Bot) Run(ctx context.Context, updatesFn func(chatID, userID int64, text
 			if u.UpdateID > b.lastUpdate {
 				b.lastUpdate = u.UpdateID
 			}
-			if u.Message == nil || strings.TrimSpace(u.Message.Text) == "" {
+			msg := u.Message
+			if msg == nil {
 				continue
 			}
-			msg := u.Message
 			// авторизация: allowlist
 			var uid int64
 			if msg.From != nil {
@@ -317,7 +490,15 @@ func (b *Bot) Run(ctx context.Context, updatesFn func(chatID, userID int64, text
 					"uid", uid, "username", userOf(msg.From))
 				continue
 			}
-			go updatesFn(msg.Chat.ID, uid, msg.Text, false) // каждый апдейт — отдельная горутина
+			// голосовое / аудио вложение → транскрипция в раннере
+			if att := voiceAttachmentOf(msg); att != nil {
+				go updatesFn(msg.Chat.ID, uid, "", att)
+				continue
+			}
+			if strings.TrimSpace(msg.Text) == "" {
+				continue // стикеры, фото и прочее — мимо
+			}
+			go updatesFn(msg.Chat.ID, uid, msg.Text, nil) // каждый апдейт — отдельная горутина
 		}
 	}
 }
@@ -330,6 +511,36 @@ func userOf(u *TgUser) string {
 		return "@" + u.Username
 	}
 	return u.FirstName
+}
+
+// voiceAttachmentOf — нормализует voice/audio часть сообщения (nil если это не аудио).
+func voiceAttachmentOf(m *TgMessage) *VoiceAttachment {
+	if m == nil {
+		return nil
+	}
+	if m.Voice != nil {
+		return &VoiceAttachment{
+			FileID:   m.Voice.FileID,
+			FileName: "voice.ogg", // Telegram шлёт OGG/Opus
+			Kind:     "voice",
+			Duration: m.Voice.Duration,
+			Size:     m.Voice.FileSize,
+		}
+	}
+	if m.Audio != nil {
+		name := m.Audio.FileName
+		if name == "" || filepath.Ext(name) == "" {
+			name = "audio.mp3"
+		}
+		return &VoiceAttachment{
+			FileID:   m.Audio.FileID,
+			FileName: name,
+			Kind:     "audio",
+			Duration: m.Audio.Duration,
+			Size:     m.Audio.FileSize,
+		}
+	}
+	return nil
 }
 
 func mustJSON(v any) []byte {

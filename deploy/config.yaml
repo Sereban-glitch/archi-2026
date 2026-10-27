@@ -119,3 +119,37 @@ memory:
   dir: /var/lib/archi/memory   # memory.jsonl + skills/
   recall_limit: 8
   max_entries: 5000
+
+# ---------- Голосовой интерфейс (2026.11) ----------
+# STT — OpenAI-совместимый POST {base_url}/audio/transcriptions (multipart).
+# Работает с: Groq (whisper-large-v3-turbo), OpenAI (whisper-1),
+# локальным whisper.cpp server / Speaches / LocalAI (base_url http://127.0.0.1:9000/v1).
+voice:
+  stt:
+    enabled: false              # включи после настройки ключа
+    base_url: https://api.groq.com/openai/v1
+    api_key: ${GROQ_API_KEY:-}   # для локального сервера можно оставить пустым
+    model: whisper-large-v3-turbo
+    language: ru                # пусто = автоопределение
+    convert: auto               # auto|always|never — ogg→wav 16кГц для локальных серверов
+    timeout: 60s
+    max_bytes: 20971520         # 20 МБ (потолок Telegram Bot API)
+
+  # TTS — опциональная озвучка ответов (OpenAI-совместимый /audio/speech).
+  # Формат opus → отправляется в Telegram как голосовое (sendVoice).
+  tts:
+    enabled: false
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY:-}
+    model: gpt-4o-mini-tts
+    voice: alloy
+    format: opus
+    timeout: 60s
+    max_chars: 1000             # более длинные ответы не озвучиваются
+
+  # Микрофон ноутбука — для команды `archi voice`.
+  mic:
+    backend: auto               # auto|arecord|ffmpeg|parecord
+    device: default             # default | hw:0,0 | имя pulse-источника
+    sample_rate: 16000         # то, что любит Whisper
+    max_duration: 120s         # protect-таймер от забытой записи

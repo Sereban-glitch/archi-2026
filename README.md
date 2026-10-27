@@ -19,8 +19,14 @@
 - **Инструменты**: `local_bash` / `remote_bash`, `read_file` / `write_file` /
   `list_directory` (с параметром ноды), `systemd_status` / `systemd_restart`,
   `node_status`, `memory_recall` / `memory_save`, `search_knowledge`.
-- **Два интерфейса**: Telegram (long polling с защитой от ECONNRESET) и
-  локальный CLI через UNIX-сокет (`archi ctl "текст"`).
+- **Два интерфейса + голос**: Telegram (long polling с защитой от ECONNRESET,
+  голосовые сообщения → STT → агент, опциональный голосовой ответ TTS) и
+  локальный CLI через UNIX-сокет (`archi ctl "текст"`, `archi voice` —
+  запрос с микрофона с распознаванием и озвучкой ответа).
+- **Голосовой движок** (2026.11): OpenAI-совместимый STT-протокол — работает
+  с Groq `whisper-large-v3-turbo`, OpenAI `whisper-1` и локальным
+  whisper.cpp server без изменения кода; микрофон через arecord/ffmpeg/parecord;
+  ноль CGO — статическая сборка сохранена.
 - **Долговременная память**: JSONL + keyword-recall + компактизация истории
   (LLM-сводка при переполнении контекста).
 - **Zero-dependency**: один статический бинарник ~8 МБ, только stdlib +
@@ -113,6 +119,8 @@ make check          # валидация deploy/config.yaml
 archi ctl --status
 archi ctl "проверь логи console-bot на сервере за последний час"
 archi ctl --reset           # сброс контекста IPC-сессии
+archi voice                 # голосом с микрофона: запись → STT → агент → ответ
+archi voice --speak         # то же + озвучка ответа (нужен voice.tts.enabled)
 
 # в Telegram:
 /status   — состояние узлов

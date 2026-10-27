@@ -43,19 +43,20 @@ type Config struct {
 	DataDir  string `yaml:"data_dir"`
 	LogLevel string `yaml:"log_level"`
 
-	LLM     LLMConfig     `yaml:"llm"`
-	Agent   AgentConfig   `yaml:"agent"`
-	Bridge  BridgeConfig  `yaml:"bridge"`
-	Alerts  AlertsConfig  `yaml:"alerts"`
-	Tools   ToolsConfig   `yaml:"tools"`
+	LLM      LLMConfig      `yaml:"llm"`
+	Agent    AgentConfig    `yaml:"agent"`
+	Bridge   BridgeConfig   `yaml:"bridge"`
+	Alerts   AlertsConfig   `yaml:"alerts"`
+	Tools    ToolsConfig    `yaml:"tools"`
 	Telegram TelegramConfig `yaml:"telegram"`
-	IPC     IPCConfig     `yaml:"ipc"`
-	Memory  MemoryConfig  `yaml:"memory"`
+	IPC      IPCConfig      `yaml:"ipc"`
+	Memory   MemoryConfig   `yaml:"memory"`
+	Voice    VoiceConfig    `yaml:"voice"`
 }
 
 type LLMConfig struct {
-	BaseURL    string   `yaml:"base_url"`     // антгравити-прокси, напр. http://127.0.0.1:18080
-	APIKey     string   `yaml:"api_key"`     // напр. local-proxy
+	BaseURL    string   `yaml:"base_url"` // антгравити-прокси, напр. http://127.0.0.1:18080
+	APIKey     string   `yaml:"api_key"`  // напр. local-proxy
 	Model      string   `yaml:"model"`
 	MaxTokens  int      `yaml:"max_tokens"`
 	Timeout    Duration `yaml:"timeout"`
@@ -73,16 +74,16 @@ type AgentConfig struct {
 }
 
 type BridgeConfig struct {
-	Interval        Duration    `yaml:"interval"`
-	RemoteTimeout   Duration    `yaml:"remote_timeout"`
-	CommandTimeout  Duration    `yaml:"command_timeout"`
-	MaxOutputBytes  int         `yaml:"max_output_bytes"`
-	Remote          SSHConfig   `yaml:"remote"`
-	Watchdog        WatchdogConfig `yaml:"watchdog"`
+	Interval       Duration       `yaml:"interval"`
+	RemoteTimeout  Duration       `yaml:"remote_timeout"`
+	CommandTimeout Duration       `yaml:"command_timeout"`
+	MaxOutputBytes int            `yaml:"max_output_bytes"`
+	Remote         SSHConfig      `yaml:"remote"`
+	Watchdog       WatchdogConfig `yaml:"watchdog"`
 }
 
 type SSHConfig struct {
-	Host              string   `yaml:"host"`        // ~/.ssh/config Host, напр. agrobot-prod
+	Host              string   `yaml:"host"` // ~/.ssh/config Host, напр. agrobot-prod
 	User              string   `yaml:"user"`
 	Port              int      `yaml:"port"`
 	KeyPath           string   `yaml:"key_path"`
@@ -100,29 +101,29 @@ type WatchdogConfig struct {
 }
 
 type AlertsConfig struct {
-	RAMPercent   float64  `yaml:"ram_percent"`
-	CPUPercent   float64  `yaml:"cpu_percent"`
-	DiskPercent  float64  `yaml:"disk_percent"`
-	Cooldown     Duration `yaml:"cooldown"`
-	Services     []string `yaml:"services"` // мониторятся на обеих нодах
+	RAMPercent  float64  `yaml:"ram_percent"`
+	CPUPercent  float64  `yaml:"cpu_percent"`
+	DiskPercent float64  `yaml:"disk_percent"`
+	Cooldown    Duration `yaml:"cooldown"`
+	Services    []string `yaml:"services"` // мониторятся на обеих нодах
 }
 
 type ToolsConfig struct {
-	MaxReadBytes         int      `yaml:"max_read_bytes"`
-	AllowedWriteDirs     []string `yaml:"allowed_write_dirs"`
-	AllowedRestart       []string `yaml:"allowed_restart_services"`
-	BashDenyPatterns     []string `yaml:"bash_deny_patterns"`
+	MaxReadBytes          int      `yaml:"max_read_bytes"`
+	AllowedWriteDirs      []string `yaml:"allowed_write_dirs"`
+	AllowedRestart        []string `yaml:"allowed_restart_services"`
+	BashDenyPatterns      []string `yaml:"bash_deny_patterns"`
 	ForbiddenReadPatterns []string `yaml:"forbidden_read_patterns"`
 }
 
 type TelegramConfig struct {
-	Enabled    bool         `yaml:"enabled"`
-	APIBase    string       `yaml:"api_base"`
-	Token      string       `yaml:"token"`
-	Allowed    []int64      `yaml:"allowed"`
-	Admins     []int64      `yaml:"admins"`
-	PollTimeout Duration    `yaml:"poll_timeout"`
-	Digest     DigestConfig `yaml:"digest"`
+	Enabled     bool         `yaml:"enabled"`
+	APIBase     string       `yaml:"api_base"`
+	Token       string       `yaml:"token"`
+	Allowed     []int64      `yaml:"allowed"`
+	Admins      []int64      `yaml:"admins"`
+	PollTimeout Duration     `yaml:"poll_timeout"`
+	Digest      DigestConfig `yaml:"digest"`
 }
 
 type DigestConfig struct {
@@ -137,9 +138,48 @@ type IPCConfig struct {
 }
 
 type MemoryConfig struct {
-	Dir         string  `yaml:"dir"`
-	RecallLimit int     `yaml:"recall_limit"`
-	MaxEntries  int     `yaml:"max_entries"`
+	Dir         string `yaml:"dir"`
+	RecallLimit int    `yaml:"recall_limit"`
+	MaxEntries  int    `yaml:"max_entries"`
+}
+
+// VoiceConfig — голосовой интерфейс: STT, TTS и микрофон.
+type VoiceConfig struct {
+	STT VoiceSTTConfig `yaml:"stt"`
+	TTS VoiceTTSConfig `yaml:"tts"`
+	Mic VoiceMicConfig `yaml:"mic"`
+}
+
+// VoiceSTTConfig — распознавание речи (OpenAI-совместимый /audio/transcriptions).
+type VoiceSTTConfig struct {
+	Enabled  bool     `yaml:"enabled"`
+	BaseURL  string   `yaml:"base_url"` // https://api.groq.com/openai/v1 | http://127.0.0.1:9000/v1
+	APIKey   string   `yaml:"api_key"`  // ${GROQ_API_KEY} / ${OPENAI_API_KEY}; пусто для локального сервера
+	Model    string   `yaml:"model"`    // whisper-large-v3-turbo (Groq) / whisper-1 (OpenAI)
+	Language string   `yaml:"language"` // подсказка языка: ru / en / "" = авто
+	Convert  string   `yaml:"convert"`  // auto|always|never — ogg/mp3 → wav 16кГц через ffmpeg
+	Timeout  Duration `yaml:"timeout"`
+	MaxBytes int64    `yaml:"max_bytes"` // лимит размера аудио
+}
+
+// VoiceTTSConfig — синтез речи (OpenAI-совместимый /audio/speech), опционально.
+type VoiceTTSConfig struct {
+	Enabled  bool     `yaml:"enabled"`
+	BaseURL  string   `yaml:"base_url"` // https://api.openai.com/v1
+	APIKey   string   `yaml:"api_key"`  // ${OPENAI_API_KEY}
+	Model    string   `yaml:"model"`    // gpt-4o-mini-tts / tts-1 / playai-tts (Groq)
+	Voice    string   `yaml:"voice"`    // alloy (OpenAI) / Fritz-PlayAI (Groq)
+	Format   string   `yaml:"format"`   // opus (Telegram-friendly) | mp3 | wav
+	Timeout  Duration `yaml:"timeout"`
+	MaxChars int      `yaml:"max_chars"` // длиннее — не озвучиваем, отвечаем текстом
+}
+
+// VoiceMicConfig — запись с микрофона ноутбука для `archi voice`.
+type VoiceMicConfig struct {
+	Backend     string   `yaml:"backend"`      // auto|arecord|ffmpeg|parecord
+	Device      string   `yaml:"device"`       // default | hw:0,0 | имя pulse-source
+	SampleRate  int      `yaml:"sample_rate"`  // 16000 — то, что любит Whisper
+	MaxDuration Duration `yaml:"max_duration"` // protect-таймер от забытой записи
 }
 
 var envRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}`)
@@ -310,6 +350,48 @@ func (c *Config) applyDefaults() {
 		c.Memory.MaxEntries = 5000
 	}
 
+	// Голос: STT/TTS/микрофон.
+	c.Voice.STT.BaseURL = strings.TrimRight(strings.TrimSpace(c.Voice.STT.BaseURL), "/")
+	if c.Voice.STT.Convert == "" {
+		c.Voice.STT.Convert = "auto"
+	}
+	c.Voice.STT.Convert = strings.ToLower(c.Voice.STT.Convert)
+	if c.Voice.STT.Timeout.Duration == 0 {
+		c.Voice.STT.Timeout.Duration = 60 * time.Second
+	}
+	if c.Voice.STT.MaxBytes == 0 {
+		c.Voice.STT.MaxBytes = 20 << 20 // 20 МБ — лимит Bot API на скачивание
+	}
+
+	c.Voice.TTS.BaseURL = strings.TrimRight(strings.TrimSpace(c.Voice.TTS.BaseURL), "/")
+	if c.Voice.TTS.Format == "" {
+		c.Voice.TTS.Format = "opus"
+	}
+	c.Voice.TTS.Format = strings.ToLower(c.Voice.TTS.Format)
+	if c.Voice.TTS.Voice == "" && c.Voice.TTS.Enabled {
+		c.Voice.TTS.Voice = "alloy"
+	}
+	if c.Voice.TTS.Timeout.Duration == 0 {
+		c.Voice.TTS.Timeout.Duration = 60 * time.Second
+	}
+	if c.Voice.TTS.MaxChars == 0 {
+		c.Voice.TTS.MaxChars = 1000
+	}
+
+	if c.Voice.Mic.Backend == "" {
+		c.Voice.Mic.Backend = "auto"
+	}
+	c.Voice.Mic.Backend = strings.ToLower(c.Voice.Mic.Backend)
+	if c.Voice.Mic.Device == "" {
+		c.Voice.Mic.Device = "default"
+	}
+	if c.Voice.Mic.SampleRate == 0 {
+		c.Voice.Mic.SampleRate = 16000
+	}
+	if c.Voice.Mic.MaxDuration.Duration == 0 {
+		c.Voice.Mic.MaxDuration.Duration = 120 * time.Second
+	}
+
 	// Разворачиваем ~ и делаем пути абсолютными.
 	c.Bridge.Remote.KeyPath = expandPath(c.Bridge.Remote.KeyPath)
 	c.Bridge.Remote.KnownHosts = expandPath(c.Bridge.Remote.KnownHosts)
@@ -362,6 +444,38 @@ func (c *Config) Validate() []string {
 	}
 	if _, err := time.LoadLocation(c.Timezone); err != nil {
 		errs = append(errs, fmt.Sprintf("timezone %q: %v", c.Timezone, err))
+	}
+
+	// Голосовой интерфейс.
+	if c.Voice.STT.Enabled {
+		if c.Voice.STT.BaseURL == "" {
+			errs = append(errs, "voice.stt.enabled=true, но voice.stt.base_url пуст (напр. https://api.groq.com/openai/v1)")
+		} else if !strings.HasPrefix(c.Voice.STT.BaseURL, "http://") && !strings.HasPrefix(c.Voice.STT.BaseURL, "https://") {
+			errs = append(errs, "voice.stt.base_url должен начинаться с http:// или https://")
+		}
+		if c.Voice.STT.Model == "" {
+			errs = append(errs, "voice.stt.enabled=true, но voice.stt.model пуст (напр. whisper-large-v3-turbo)")
+		}
+	}
+	switch c.Voice.STT.Convert {
+	case "auto", "always", "never":
+	default:
+		errs = append(errs, fmt.Sprintf("voice.stt.convert=%q — допустимо auto|always|never", c.Voice.STT.Convert))
+	}
+	if c.Voice.TTS.Enabled {
+		if c.Voice.TTS.BaseURL == "" || c.Voice.TTS.Model == "" {
+			errs = append(errs, "voice.tts.enabled=true — укажи base_url и model")
+		}
+		switch c.Voice.TTS.Format {
+		case "opus", "mp3", "aac", "flac", "wav", "pcm":
+		default:
+			errs = append(errs, fmt.Sprintf("voice.tts.format=%q — допустимо opus|mp3|aac|flac|wav|pcm", c.Voice.TTS.Format))
+		}
+	}
+	switch c.Voice.Mic.Backend {
+	case "auto", "arecord", "ffmpeg", "parecord":
+	default:
+		errs = append(errs, fmt.Sprintf("voice.mic.backend=%q — допустимо auto|arecord|ffmpeg|parecord", c.Voice.Mic.Backend))
 	}
 	return errs
 }
