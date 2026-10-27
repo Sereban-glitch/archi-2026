@@ -1,0 +1,17 @@
+# Local configuration & secrets
+config.dev.yaml
+*.local.yaml
+*.env
+
+# Build outputs
+bin/
+
+# Runtime data & sockets
+*.sock
+*.log
+/var/
+/tmp/
+
+# Archives
+*.tar.gz
+*.zip
