@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -19,6 +20,7 @@ type Entry struct {
 	Text string    `json:"text"`
 	Tags []string  `json:"tags,omitempty"`
 	Time time.Time `json:"time"`
+	Vec  []float64 `json:"vec,omitempty"` // эмбеддинг текста (если включены memory.embeddings)
 }
 
 // Memory — долговременная память агента (JSONL, append-only + полнотекстовый recall).
@@ -28,6 +30,7 @@ type Memory struct {
 	dir   string
 	limit int
 	log   *slog.Logger
+	emb   Embedder
 
 	mu      sync.RWMutex
 	entries []Entry
@@ -48,6 +51,10 @@ func NewMemory(dir string, limit int, log *slog.Logger) (*Memory, error) {
 
 // Dir возвращает каталог памяти.
 func (m *Memory) Dir() string { return m.dir }
+
+// SetEmbedder подключает векторизацию (вызывается из main при memory.embeddings.enabled).
+// nil-safe: без Embedder память работает на keyword-recall.
+func (m *Memory) SetEmbedder(e Embedder) { m.emb = e }
 
 // SkillsDir возвращает каталог навыков (SKILL.md-подобные документы).
 func (m *Memory) SkillsDir() string { return filepath.Join(m.dir, "skills") }
@@ -79,11 +86,22 @@ func (m *Memory) load() {
 // Save добавляет запись (пишется синхронно — память дороже скорости).
 // При выходе за лимит (×1.2 гистерезис) файл компактируется: переписывается
 // последними limit записями — иначе Recall молча «забывал» старое, а файл рос вечно.
+// Эмбеддинг (если настроен) считается с таймаутом 15с; неудача НЕ блокирует
+// сохранение — запись просто останется без вектора (keyword-scoring подхватит).
 func (m *Memory) Save(kind, text string, tags ...string) error {
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
 	e := Entry{Kind: kind, Text: strings.TrimSpace(text), Tags: tags, Time: time.Now().UTC()}
+	if m.emb != nil {
+		ectx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if vecs, err := m.emb.Embed(ectx, []string{e.Text}); err == nil && len(vecs) == 1 {
+			e.Vec = vecs[0]
+		} else if err != nil {
+			m.log.Warn("memory: эмбеддинг не удался (запись без вектора)", "err", err)
+		}
+		cancel()
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -148,14 +166,26 @@ func (m *Memory) compactLocked() error {
 	return nil
 }
 
-// Recall ищет релевантные записи по запросу (ключевое совпадение, scoring по частоте).
+// Recall ищет релевантные записи по запросу. Гибрид (2027.1):
+//   - без эмбеддингов — чистый keyword-scoring (как раньше);
+//   - с эмбеддингами — 2.5×косинус + keyword-бонус: семантика находит
+//     перефразированное («сервер не отвечает» ≈ «нода недоступна»),
+//     ключевые слова страхуют от пропуска точных терминов.
 func (m *Memory) Recall(query string, k int) []Entry {
 	if k <= 0 {
 		k = 8
 	}
 	tokens := tokenize(query)
-	if len(tokens) == 0 {
+	if len(tokens) == 0 && strings.TrimSpace(query) == "" {
 		return nil
+	}
+	var qvec []float64
+	if m.emb != nil {
+		ectx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if vecs, err := m.emb.Embed(ectx, []string{query}); err == nil && len(vecs) == 1 {
+			qvec = vecs[0]
+		}
+		cancel()
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -174,13 +204,17 @@ func (m *Memory) Recall(query string, k int) []Entry {
 				sc += 1 + 0.25*(c-1) // насыщение повторов
 			}
 		}
-		if sc > 0 {
-			// свежесть: записи моложе 7 дней получают бонус ×1.2
-			if time.Since(e.Time) < 7*24*time.Hour {
-				sc *= 1.2
-			}
-			out = append(out, scored{e, sc})
+		if qvec != nil && len(e.Vec) > 0 {
+			sc += 2.5 * cosine(qvec, e.Vec) // семантическая близость
 		}
+		if sc <= 0 {
+			continue // ноль (или отрицательная) релевантность — не берём
+		}
+		// свежесть: записи моложе 7 дней получают бонус ×1.2
+		if time.Since(e.Time) < 7*24*time.Hour {
+			sc *= 1.2
+		}
+		out = append(out, scored{e, sc})
 	}
 	// сортировка вставкой (k маленькое, записей немного — без sort.Slice экономим аллокации)
 	for i := 1; i < len(out); i++ {

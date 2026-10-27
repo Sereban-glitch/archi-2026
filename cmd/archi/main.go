@@ -27,12 +27,14 @@ import (
 	"github.com/archi/archi/internal/config"
 	"github.com/archi/archi/internal/cron"
 	"github.com/archi/archi/internal/ipc"
+	"github.com/archi/archi/internal/metrics"
+	"github.com/archi/archi/internal/skills"
 	"github.com/archi/archi/internal/telegram"
 	"github.com/archi/archi/internal/tools"
 	"github.com/archi/archi/internal/voice"
 )
 
-var version = "2026.12.0"
+var version = "2026.13.0"
 
 func main() {
 	if len(os.Args) > 1 {
@@ -55,6 +57,12 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "ear":
+			if err := runEarDaemon(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, "archi-ear:", err)
+				os.Exit(1)
+			}
+			return
 		case "version":
 			fmt.Println("archi", version)
 			return
@@ -66,7 +74,7 @@ func main() {
 			return
 		}
 	}
-	fmt.Fprintf(os.Stderr, "Archi %s — гибридный DevOps-агент\n\nИспользование:\n  archi serve [--config config.yaml]\n  archi ctl \"текст\" [--config config.yaml]\n  archi voice [--speak] [--config config.yaml]\n  archi check-config [--config config.yaml]\n  archi version\n", version)
+	fmt.Fprintf(os.Stderr, "Archi %s — гибридный DevOps-агент\n\nИспользование:\n  archi serve [--config config.yaml]\n  archi ctl \"текст\" [--config config.yaml]\n  archi voice [--speak] [--config config.yaml]\n  archi ear [--config config.yaml]      — hands-free слушатель (wake-word)\n  archi check-config [--config config.yaml]\n  archi version\n", version)
 	os.Exit(2)
 }
 
@@ -134,10 +142,21 @@ func runServe(args []string) error {
 		log.Warn("timezone не загрузилась, работаю в UTC", "tz", cfg.Timezone, "err", err)
 	}
 
-	// 1) Память.
+	// 1) Память (+ опциональные эмбеддинги для семантического recall).
 	mem, err := agent.NewMemory(cfg.Memory.Dir, cfg.Memory.MaxEntries, log)
 	if err != nil {
 		return err
+	}
+	if cfg.Memory.Embeddings.Enabled {
+		mem.SetEmbedder(agent.NewHTTPEmbedder(cfg.Memory.Embeddings))
+		log.Info("memory: семантический recall включён", "model", cfg.Memory.Embeddings.Model)
+	}
+
+	// Навыки: каталог само-пишущихся процедур (memory/skills/*.md).
+	var skl *skills.Skills
+	if cfg.Skills.Enabled == nil || *cfg.Skills.Enabled {
+		skl = skills.New(mem.SkillsDir())
+		log.Info("skills: каталог включён", "dir", mem.SkillsDir(), "inject_limit", cfg.Skills.InjectLimit)
 	}
 
 	// 2) Мост (телеметрия local+remote, SSH-пул, алерты, watchdog).
@@ -154,9 +173,14 @@ func runServe(args []string) error {
 	}()
 
 	// 3) Инструменты + агент.
-	registry := tools.NewRegistry(tools.Deps{Cfg: *cfg, Bridge: br, Memory: mem, Log: log})
+	registry := tools.NewRegistry(tools.Deps{Cfg: *cfg, Bridge: br, Memory: mem, Skills: skl, Log: log})
 	llm := agent.NewClient(cfg.LLM, log)
 	ag := agent.New(cfg.Agent, llm, registry, mem, br.Snapshot, tz, log)
+	if skl != nil {
+		ag.SetSkills(skl, cfg.Skills.InjectLimit)
+	}
+	// Субагент: делегирование разведок с чистым контекстом (delegate_task).
+	registry.SetSubAgent(ag)
 
 	// 4) IPC: UNIX-сокет.
 	if cfg.IPC.Enabled {
@@ -220,6 +244,15 @@ func runServe(args []string) error {
 		eng := cron.New(cfg.Cron, ag, ntf, mem, tz, log)
 		go eng.Run(ctx)
 		log.Info("cron: движок проактивности запущен", "jobs", len(cfg.Cron.Jobs))
+	}
+
+	// 7) Observability: Prometheus /metrics + /healthz (только localhost).
+	if cfg.Observability.Enabled == nil || *cfg.Observability.Enabled {
+		go func() {
+			if err := metrics.Serve(ctx, cfg.Observability.MetricsAddr, version, log); err != nil {
+				log.Error("metrics: эндпоинт остановлен", "err", err)
+			}
+		}()
 	}
 
 	log.Info("archi запущен", "version", version, "node", cfg.NodeName, "remote", cfg.Bridge.Remote.Host, "pid", os.Getpid())
@@ -358,4 +391,29 @@ func runVoice(args []string) error {
 		}
 	}
 	return nil
+}
+
+// runEarDaemon — archi ear: hands-free слушатель «Арчи, …» (отдельный процесс,
+// deploy/archi-ear.service). Слушает микрофон, ловит wake-word, шлёт команды
+// демону через IPC и озвучивает ответы (если включён TTS).
+func runEarDaemon(args []string) error {
+	cfgPath, err := flagsConfig(args)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return err
+	}
+	if !cfg.Ear.Enabled {
+		return errors.New("ear.enabled=false — включи hands-free режим в конфиге")
+	}
+	log := newLogger(cfg.LogLevel)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log.Info("archi-ear запускается", "version", version,
+		"ipc", cfg.IPC.SocketPath, "wake_words", cfg.Ear.WakeWords)
+	return voice.RunEar(ctx, *cfg, log)
 }

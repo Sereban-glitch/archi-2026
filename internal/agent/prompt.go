@@ -6,12 +6,14 @@ import (
 	"time"
 
 	"github.com/archi/archi/internal/bridge"
+	"github.com/archi/archi/internal/skills"
 )
 
 // BuildSystemPrompt собирает динамический системный промпт:
-// живое состояние обеих машин + идентичность + политика инструментов.
-// Паттерн 2026: агент «видит» телеметрию в каждом шаге — без слепых догадок.
-func BuildSystemPrompt(tz *time.Location, st *bridge.Status, memEntries []Entry) string {
+// живое состояние обеих машин + идентичность + политика инструментов +
+// релевантная память и навыки. Паттерн 2026: агент «видит» телеметрию в каждом
+// шаге — без слепых догадок.
+func BuildSystemPrompt(tz *time.Location, st *bridge.Status, memEntries []Entry, sklDocs []skills.Doc) string {
 	var sb strings.Builder
 	now := time.Now().In(tz)
 
@@ -32,6 +34,7 @@ func BuildSystemPrompt(tz *time.Location, st *bridge.Status, memEntries []Entry)
 5. На remote помни про лимит RAM: там PostgreSQL, agrobot, info-bot и antigravity-прокси. MemoryMax=240M у console-bot — это нормально.
 6. Если команда не нужна — не выполняй её. Лучше один точный вызов, чем пять слепых.
 7. Завершай ответ обычным текстом (без tool_use), когда задача решена или нужен вопрос пользователю.
+8. Решил нетривиальную задачу — сохрани процедуру навыком (skill_save), чтобы в следующий раз не думать заново.
 
 `)
 	sb.WriteString("Текущее время: " + now.Format("2006-01-02 15:04:05 MST (Mon)") + "\n\n")
@@ -55,6 +58,17 @@ func BuildSystemPrompt(tz *time.Location, st *bridge.Status, memEntries []Entry)
 			fmt.Fprintf(&sb, "- [%s] %s\n", e.Kind, strings.ReplaceAll(text, "\n", " "))
 		}
 		sb.WriteString("\n")
+	}
+
+	if len(sklDocs) > 0 {
+		sb.WriteString("=== РЕЛЕВАНТНЫЕ НАВЫКИ (проверенные процедуры) ===\n")
+		for _, d := range sklDocs {
+			body := d.Body
+			if len(body) > 700 {
+				body = body[:700] + "…"
+			}
+			fmt.Fprintf(&sb, "--- навык: %s (%s)\n%s\n\n", d.Title, d.Name, strings.TrimSpace(body))
+		}
 	}
 	return sb.String()
 }

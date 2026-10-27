@@ -12,6 +12,17 @@ import (
 // Компилируется в тот же main с подкомандой ctl (см. cmd/archi/main.go).
 // Возвращает ответ агента (также печатает его в stdout) — нужно для `archi voice --speak`.
 func RunCLI(socketPath, text string, reset, status bool) (string, error) {
+	reply, err := RunCLIQuiet(socketPath, text, reset, status)
+	if err != nil {
+		return "", err
+	}
+	fmt.Println(reply)
+	return reply, nil
+}
+
+// RunCLIQuiet — то же без печати в stdout: для фоновых потребителей
+// (ear-демона, `archi voice`), где ответ уходит дальше по конвейеру.
+func RunCLIQuiet(socketPath, text string, reset, status bool) (string, error) {
 	conn, err := net.DialTimeout("unix", socketPath, 3*time.Second)
 	if err != nil {
 		return "", fmt.Errorf("не подключиться к %s (archi запущен?): %w", socketPath, err)
@@ -40,7 +51,6 @@ func RunCLI(socketPath, text string, reset, status bool) (string, error) {
 	if !resp.OK {
 		return "", fmt.Errorf("агент: %s", resp.Error)
 	}
-	fmt.Println(resp.Reply)
 	return resp.Reply, nil
 }
 

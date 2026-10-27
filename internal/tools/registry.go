@@ -15,6 +15,8 @@ import (
 	"github.com/archi/archi/internal/agent"
 	"github.com/archi/archi/internal/bridge"
 	"github.com/archi/archi/internal/config"
+	"github.com/archi/archi/internal/metrics"
+	"github.com/archi/archi/internal/skills"
 )
 
 // Deps — зависимости, внедряемые в инструменты.
@@ -22,6 +24,7 @@ type Deps struct {
 	Cfg    config.Config
 	Bridge *bridge.Bridge
 	Memory *agent.Memory
+	Skills *skills.Skills // nil = инструменты навыков не регистрируются
 	Log    *slog.Logger
 }
 
@@ -51,6 +54,7 @@ type Registry struct {
 	approval  []*regexp.Regexp // опасное — только после подтверждения владельца
 	forbidden []*regexp.Regexp // секретные пути — не читаются
 	approver  Approver
+	subAgent  SubAgentRunner // делегирование подзадач (подключается после создания агента)
 	deps      Deps
 }
 
@@ -86,6 +90,12 @@ func NewRegistry(deps Deps) *Registry {
 	r.registerSystemd()
 	r.registerTelemetry()
 	r.registerKnowledge()
+	if deps.Skills != nil {
+		r.registerSkills()
+	}
+	if deps.Cfg.Browser.Enabled {
+		r.registerBrowser()
+	}
 	return r
 }
 
@@ -133,6 +143,7 @@ func (r *Registry) Call(ctx context.Context, name string, input json.RawMessage)
 	if !ok {
 		return fmt.Sprintf("ОШИБКА: неизвестный инструмент %q (доступны: %v)", name, r.order), true
 	}
+	started := time.Now()
 	timeout := t.Timeout
 	if timeout <= 0 {
 		timeout = r.deps.Cfg.Bridge.CommandTimeout.Duration
@@ -160,11 +171,16 @@ func (r *Registry) Call(ctx context.Context, name string, input json.RawMessage)
 	}()
 	select {
 	case o := <-ch:
+		metrics.Inc("archi_tool_calls_total", "tool", name, "result", boolLabel[o.isErr])
+		metrics.Add("archi_tool_seconds_total", time.Since(started).Seconds(), "tool", name)
 		return o.text, o.isErr
 	case <-cctx.Done():
+		metrics.Inc("archi_tool_calls_total", "tool", name, "result", "timeout")
 		return fmt.Sprintf("ОШИБКА: инструмент %s прерван: %v", name, cctx.Err()), true
 	}
 }
+
+var boolLabel = map[bool]string{false: "ok", true: "error"}
 
 // truncateUTF8 — усечение результата по байтам без разрыва UTF-8 рун
 // (битая руна в tool_result ломала парсинг на стороне API, аудит 2026-10).

@@ -1,4 +1,124 @@
-# HANDOFF — Archi 2026.12 «Автономность»
+# HANDOFF — Archi 2026.13 «Эталон 2026»
+
+Turnkey-релиз: все фиксы аудита + все модули, закрывающие GAP к эталонным
+агентам 2025–2026. Ничего включать в коде не надо — только собрать, положить
+конфиг и запустить юниты. Ниже — что добавлено к 2026.12, затем прежний
+handoff 2026.12 без изменений.
+
+---
+
+## 0. Что в 2026.13 (кратко)
+
+| Модуль | Где | Что делает |
+|---|---|---|
+| Hands-free голос | `internal/voice/ear.go`, `archi ear`, `deploy/archi-ear.service` | RMS-VAD + wake-word «арчи» → STT → агент → TTS; barge-in |
+| Само-пишущиеся навыки | `internal/skills`, `tools/skills.go` | skill_save/read/list, инъекция в промпт |
+| Субагенты | `tools/subagent.go` | delegate_task: чистый контекст, глубина ≤1 |
+| Векторный recall | `agent/embed.go`, `memory.go` | /embeddings + косинус + keyword-гибрид |
+| Браузер | `tools/browser.go` | headless Chromium по CDP: текст + скриншоты |
+| Observability | `internal/metrics` | Prometheus /metrics + /healthz, 127.0.0.1:9109 |
+| TTS Piper | `voice/tts.go`, `deploy/setup-piper.sh` | офлайн-озвучка, ru-голоса, автоконвертация opus |
+| LLM-failover | `agent/llm.go` | цепочка `llm.providers` после ретраев основного |
+
+### 0.1. Hands-free `archi ear` — как устроен
+
+- **Отдельный процесс** (systemd): микрофонный цикл не умирает при рестарте
+  демона; команда уходит через IPC-сокет (`ipc.RunCLIQuiet`).
+- **VAD**: энергия RMS, адаптивный шумовой пол (калибровка `noise_learn_s`,
+  затем медленная EMA в тишине), гистерезис start_factor/stop_factor,
+  `min_speech_ms` отфильтровывает клики, pre-roll ~400 мс не режет начало
+  wake-word, `max_utterance` обрубает бесконечную речь.
+- **Wake-word**: первый токен транскрипта после нормализации (ё→е, пунктуация);
+  допуск опечаток Левенштейн ≤1 для токенов ≥4 символов («арчии» сработает).
+  Голый wake-word → режим «слушаю следующую фразу».
+- **Полудуплекс + barge-in**: во время озвучки кадры НЕ кормят VAD (эхо не
+  портит шумовой пол), но громкая устойчивая речь (×1.8 от старта, ~240 мс)
+  отменяет плеер. После ответа — cooldown (анти-эхо).
+- Валидация: `ear.enabled=true` требует `ipc.enabled=true` и
+  `voice.stt.enabled=true` (проверяет `check-config`).
+- Запуск: `sudo systemctl enable --now archi-ear`, логи `journalctl -u archi-ear -f`.
+
+### 0.2. Навыки и субагенты
+
+- Навык = markdown `memory/skills/<name>.md` («# Заголовок», «tags: …», тело).
+  Поиск: заголовок ×3 / теги ×2 / тело ×1; топ-`inject_limit` подмешивается
+  в системный промпт на каждый запрос. Сохранение атомарно (tmp+rename).
+- `delegate_task`: субагент получает ту же панель инструментов, но свою
+  сессию `sub:<unixts>`; вывод урезается до 8 КБ; вложенность запрещена
+  (глобальный CAS-счётчик глубины).
+- Выключаются: `skills.enabled: false`; субагент-инструмент не регистрируется,
+  пока `SetSubAgent` не подключён (в main подключается всегда после старта).
+
+### 0.3. Память с эмбеддингами
+
+- `memory.embeddings.enabled: true` → каждая запись векторизуется (батч
+  на Save, таймаут 15 с; неудача не блокирует запись — остаётся keyword-recall).
+- Recall: score = keyword-насыщение + 2.5×косинус(query, entry.vec) +
+  свежесть ×1.2 (<7 дней). Вектор живёт прямо в JSONL — компакция его
+  сохраняет автоматически.
+
+### 0.4. Браузер
+
+- `browser.enabled: true` + установленный chromium. Single-shot: чистый
+  профиль на вызов, DevTools WS, `Page.navigate` → load → `Runtime.evaluate`
+  (innerText) → опционально `Page.captureScreenshot` (JPEG, q70) в
+  `<data_dir>/browser/`. Процесс гасится всегда (defer kill).
+- НЕ для интерактивных потоков «логин → клик → 2FA» — это остаётся за
+  владельцем (принцип Operator takeover).
+
+### 0.5. Observability
+
+- `observability.metrics_addr: 127.0.0.1:9109` → `GET /metrics` (Prometheus
+  text: `archi_llm_requests_total`, `archi_llm_tokens_total{dir=in|out}`,
+  `archi_tool_calls_total{tool,result}`, `archi_uptime_seconds`) и
+  `GET /healthz`. Выключается `observability.enabled: false`.
+- Ноль зависимостей: собственный счётчикный реестр с мьютексом.
+
+### 0.6. TTS Piper (офлайн)
+
+- `sudo bash deploy/setup-piper.sh [irina|ruslan|dmitri]` → /opt/piper.
+- Конфиг: `voice.tts.provider: piper`, `piper.bin`, `piper.model`.
+- Синтез: текст → stdin бинаря → WAV → (ffmpeg) → opus для Telegram.
+  Без ffmpeg отдаёт WAV (локальное воспроизведение работает).
+
+### 0.7. LLM-failover
+
+- `llm.providers: [{base_url, api_key, model}]` — обходится по порядку,
+  когда основной (включая свои 5 ретраев) исчерпан. Форма запросов та же
+  Anthropic Messages — подойдёт любой прокси/зеркало.
+
+### 0.8. Включение на ноутбуке (дополнение к §4)
+
+```bash
+git pull && go vet ./... && go test ./... && make build
+sudo cp bin/archi /usr/local/bin/ && sudo systemctl restart archi
+
+# голос полный стек:
+sudo bash deploy/setup-piper.sh               # офлайн-TTS (опционально)
+# config.yaml: voice.stt.enabled: true, voice.tts.provider: piper|openai,
+#              ear.enabled: true
+sudo cp deploy/archi-ear.service /etc/systemd/system/ && systemctl daemon-reload
+sudo systemctl enable --now archi-ear
+sudo systemctl restart archi
+```
+
+### 0.9. Как проверялось (2026.13)
+
+- `go vet` чист; `go test ./...` — 30 тестов в 7 пакетах, все PASS
+  (новые: VAD-фраза/клик/лимит, wake-word с опечатками, editDistance,
+  WAV-заголовок, playExt; skills, metrics, memory-эмбеддинги).
+- E2E-смоук: serve → IPC-сокет → `ctl --status` (usage + ноды) →
+  `curl /metrics` + `/healthz` → graceful-фолбэк без LLM → `archi ear`
+  корректно отказывает при `ear.enabled=false`.
+- Пойман и исправлен дедлок `SetSubAgent` (двойной захват r.mu) — нашёлся
+  именно смоук-запуском: демон молча висел до IPC. В 2026.12 его не было,
+  т.к. SetSubAgent тогда не вызывался из main.
+- `check-config` на deploy/config.yaml — ОК (включая новые секции).
+- Статик CGO_ENABLED=0, 8.8 МБ, `archi version` → 2026.13.0.
+
+---
+
+# Прежний HANDOFF — Archi 2026.12 «Автономность»
 
 Релиз закрывает топ-3 разрыва с эталонными агентами 2026 (аудит/разведка,
 см. §1) и всю критическую findings-часть аудита кода: **проактивность**

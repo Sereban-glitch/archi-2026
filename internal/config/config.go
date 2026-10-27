@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -43,25 +44,38 @@ type Config struct {
 	DataDir  string `yaml:"data_dir"`
 	LogLevel string `yaml:"log_level"`
 
-	LLM      LLMConfig      `yaml:"llm"`
-	Agent    AgentConfig    `yaml:"agent"`
-	Bridge   BridgeConfig   `yaml:"bridge"`
-	Alerts   AlertsConfig   `yaml:"alerts"`
-	Tools    ToolsConfig    `yaml:"tools"`
-	Telegram TelegramConfig `yaml:"telegram"`
-	IPC      IPCConfig      `yaml:"ipc"`
-	Memory   MemoryConfig   `yaml:"memory"`
-	Voice    VoiceConfig    `yaml:"voice"`
-	Cron     CronConfig     `yaml:"cron"`
+	LLM           LLMConfig           `yaml:"llm"`
+	Agent         AgentConfig         `yaml:"agent"`
+	Bridge        BridgeConfig        `yaml:"bridge"`
+	Alerts        AlertsConfig        `yaml:"alerts"`
+	Tools         ToolsConfig         `yaml:"tools"`
+	Telegram      TelegramConfig      `yaml:"telegram"`
+	IPC           IPCConfig           `yaml:"ipc"`
+	Memory        MemoryConfig        `yaml:"memory"`
+	Skills        SkillsConfig        `yaml:"skills"`
+	Voice         VoiceConfig         `yaml:"voice"`
+	Ear           EarConfig           `yaml:"ear"`
+	Browser       BrowserConfig       `yaml:"browser"`
+	Cron          CronConfig          `yaml:"cron"`
+	Observability ObservabilityConfig `yaml:"observability"`
 }
 
 type LLMConfig struct {
-	BaseURL    string   `yaml:"base_url"` // антгравити-прокси, напр. http://127.0.0.1:18080
-	APIKey     string   `yaml:"api_key"`  // напр. local-proxy
-	Model      string   `yaml:"model"`
-	MaxTokens  int      `yaml:"max_tokens"`
-	Timeout    Duration `yaml:"timeout"`
-	MaxRetries int      `yaml:"max_retries"`
+	BaseURL    string              `yaml:"base_url"` // антгравити-прокси, напр. http://127.0.0.1:18080
+	APIKey     string              `yaml:"api_key"`  // напр. local-proxy
+	Model      string              `yaml:"model"`
+	MaxTokens  int                 `yaml:"max_tokens"`
+	Timeout    Duration            `yaml:"timeout"`
+	MaxRetries int                 `yaml:"max_retries"`
+	Providers  []LLMProviderConfig `yaml:"providers"` // failover-цепочка (self-healing)
+}
+
+// LLMProviderConfig — резервный провайдер: когда основной исчерпал ретраи,
+// запрос уходит сюда (другой URL/ключ/модель той же Anthropic-совместимой формы).
+type LLMProviderConfig struct {
+	BaseURL string `yaml:"base_url"`
+	APIKey  string `yaml:"api_key"`
+	Model   string `yaml:"model"`
 }
 
 type AgentConfig struct {
@@ -160,9 +174,66 @@ type IPCConfig struct {
 }
 
 type MemoryConfig struct {
-	Dir         string `yaml:"dir"`
-	RecallLimit int    `yaml:"recall_limit"`
-	MaxEntries  int    `yaml:"max_entries"`
+	Dir         string           `yaml:"dir"`
+	RecallLimit int              `yaml:"recall_limit"`
+	MaxEntries  int              `yaml:"max_entries"`
+	Embeddings  EmbeddingsConfig `yaml:"embeddings"` // семантический recall (косинус)
+}
+
+// EmbeddingsConfig — векторизация записей памяти через OpenAI-совместимый
+// POST {base_url}/embeddings. Выключено по умолчанию: без ключей всё равно
+// работает гибридный keyword-recall.
+type EmbeddingsConfig struct {
+	Enabled bool     `yaml:"enabled"`
+	BaseURL string   `yaml:"base_url"` // напр. https://api.openai.com/v1
+	APIKey  string   `yaml:"api_key"`  // ${OPENAI_API_KEY}
+	Model   string   `yaml:"model"`    // text-embedding-3-small
+	Timeout Duration `yaml:"timeout"`
+}
+
+// SkillsConfig — само-пишущиеся навыки (SKILL.md в memory/skills/).
+// Enabled nil = true: каталог навыков есть — инъекция в промпт работает.
+type SkillsConfig struct {
+	Enabled     *bool `yaml:"enabled"`
+	InjectLimit int   `yaml:"inject_limit"` // сколько навыков подмешивать в промпт
+}
+
+// ObservabilityConfig — Prometheus-эндпоинт на localhost. Enabled nil = true.
+type ObservabilityConfig struct {
+	Enabled     *bool  `yaml:"enabled"`
+	MetricsAddr string `yaml:"metrics_addr"` // 127.0.0.1:9109; только localhost!
+}
+
+// EarConfig — hands-free голос («арчи, …»): VAD → wake-word → команда → ответ голосом.
+// Запускается отдельным процессом `archi ear` (deploy/archi-ear.service).
+type EarConfig struct {
+	Enabled      bool         `yaml:"enabled"` // валидация связок; слушатель живёт отдельно
+	WakeWords    []string     `yaml:"wake_words"`
+	MaxUtterance Duration     `yaml:"max_utterance"`
+	Cooldown     Duration     `yaml:"cooldown"` // пауза после ответа (анти-эхо)
+	BargeIn      *bool        `yaml:"barge_in"` // перебивать ли озвучку речью; nil = true
+	VAD          EarVADConfig `yaml:"vad"`
+}
+
+// EarVADConfig — энергия-RMS VAD (чистый Go, без моделей): адаптивный шумовой пол,
+// гистерезис старт/стоп, минимальная длительность фразы.
+type EarVADConfig struct {
+	FrameMs     int     `yaml:"frame_ms"`      // окно анализа (мс)
+	StartFactor float64 `yaml:"start_factor"`  // RMS > floor*factor → речь
+	StopFactor  float64 `yaml:"stop_factor"`   // RMS < floor*factor → тишина
+	MinSpeechMs int     `yaml:"min_speech_ms"` // короче — не фраза (шум/клик)
+	SilenceMs   int     `yaml:"silence_ms"`    // тишина в конце фразы
+	NoiseLearnS int     `yaml:"noise_learn_s"` // калибровка шума при старте (сек)
+}
+
+// BrowserConfig — CDP-браузерный инструмент (текст страницы + скриншот).
+// Требует chromium/google-chrome; выключен по умолчанию.
+type BrowserConfig struct {
+	Enabled      bool     `yaml:"enabled"`
+	ChromeBin    string   `yaml:"chrome_bin"`     // "" = авто-детект chromium/google-chrome
+	Headless     *bool    `yaml:"headless"`       // nil = true
+	Timeout      Duration `yaml:"timeout"`        // на операцию
+	MaxTextBytes int      `yaml:"max_text_bytes"` // лимит извлечённого текста
 }
 
 // VoiceConfig — голосовой интерфейс: STT, TTS и микрофон.
@@ -187,16 +258,27 @@ type VoiceSTTConfig struct {
 	Fallback *VoiceSTTConfig `yaml:"fallback"`  // резервный провайдер (optional)
 }
 
-// VoiceTTSConfig — синтез речи (OpenAI-совместимый /audio/speech), опционально.
+// VoiceTTSConfig — синтез речи: provider openai (облако, /audio/speech) или
+// piper (локальный офлайн-синтез, внешний бинарь). Опционально.
 type VoiceTTSConfig struct {
-	Enabled  bool     `yaml:"enabled"`
-	BaseURL  string   `yaml:"base_url"` // https://api.openai.com/v1
-	APIKey   string   `yaml:"api_key"`  // ${OPENAI_API_KEY}
-	Model    string   `yaml:"model"`    // gpt-4o-mini-tts / tts-1 / playai-tts (Groq)
-	Voice    string   `yaml:"voice"`    // alloy (OpenAI) / Fritz-PlayAI (Groq)
-	Format   string   `yaml:"format"`   // opus (Telegram-friendly) | mp3 | wav
-	Timeout  Duration `yaml:"timeout"`
-	MaxChars int      `yaml:"max_chars"` // длиннее — не озвучиваем, отвечаем текстом
+	Enabled  bool        `yaml:"enabled"`
+	Provider string      `yaml:"provider"` // openai | piper
+	BaseURL  string      `yaml:"base_url"` // https://api.openai.com/v1
+	APIKey   string      `yaml:"api_key"`  // ${OPENAI_API_KEY}
+	Model    string      `yaml:"model"`    // gpt-4o-mini-tts / tts-1 / playai-tts (Groq)
+	Voice    string      `yaml:"voice"`    // alloy (OpenAI) / Fritz-PlayAI (Groq)
+	Format   string      `yaml:"format"`   // opus (Telegram-friendly) | mp3 | wav
+	Timeout  Duration    `yaml:"timeout"`
+	MaxChars int         `yaml:"max_chars"` // длиннее — не озвучиваем, отвечаем текстом
+	Piper    PiperConfig `yaml:"piper"`
+}
+
+// PiperConfig — локальный нейро-синтез Piper (https://github.com/rhasspy/piper).
+// Голоса: https://huggingface.co/rhasspy/piper-voices (ru_RU: irina, dmitri, ruslan).
+type PiperConfig struct {
+	Bin     string   `yaml:"bin"`   // путь к бинарю piper (ставит deploy/setup-piper.sh)
+	Model   string   `yaml:"model"` // .onnx-голос, напр. ru_RU-irina-medium.onnx
+	Timeout Duration `yaml:"timeout"`
 }
 
 // VoiceMicConfig — запись с микрофона ноутбука для `archi voice`.
@@ -438,6 +520,84 @@ func (c *Config) applyDefaults() {
 		}
 	}
 
+	// Skills: само-пишущиеся навыки (SKILL.md в memory/skills/).
+	if c.Skills.Enabled == nil {
+		on := true
+		c.Skills.Enabled = &on
+	}
+	if c.Skills.InjectLimit == 0 {
+		c.Skills.InjectLimit = 2
+	}
+
+	// Observability: Prometheus на localhost.
+	if c.Observability.Enabled == nil {
+		on := true
+		c.Observability.Enabled = &on
+	}
+	if c.Observability.MetricsAddr == "" {
+		c.Observability.MetricsAddr = "127.0.0.1:9109"
+	}
+
+	// Память: эмбеддинги опциональны (без ключей — гибридный keyword-recall).
+	c.Memory.Embeddings.BaseURL = strings.TrimRight(strings.TrimSpace(c.Memory.Embeddings.BaseURL), "/")
+	if c.Memory.Embeddings.Timeout.Duration == 0 {
+		c.Memory.Embeddings.Timeout.Duration = 15 * time.Second
+	}
+
+	// TTS: провайдер openai | piper.
+	c.Voice.TTS.Provider = strings.ToLower(strings.TrimSpace(c.Voice.TTS.Provider))
+	if c.Voice.TTS.Provider == "" {
+		c.Voice.TTS.Provider = "openai"
+	}
+	if c.Voice.TTS.Piper.Timeout.Duration == 0 {
+		c.Voice.TTS.Piper.Timeout.Duration = 30 * time.Second
+	}
+
+	// Ear: hands-free голос.
+	if len(c.Ear.WakeWords) == 0 {
+		c.Ear.WakeWords = []string{"арчи", "archi"}
+	}
+	if c.Ear.MaxUtterance.Duration == 0 {
+		c.Ear.MaxUtterance.Duration = 20 * time.Second
+	}
+	if c.Ear.Cooldown.Duration == 0 {
+		c.Ear.Cooldown.Duration = 4 * time.Second
+	}
+	if c.Ear.BargeIn == nil {
+		on := true
+		c.Ear.BargeIn = &on
+	}
+	if c.Ear.VAD.FrameMs == 0 {
+		c.Ear.VAD.FrameMs = 30
+	}
+	if c.Ear.VAD.StartFactor == 0 {
+		c.Ear.VAD.StartFactor = 3.2
+	}
+	if c.Ear.VAD.StopFactor == 0 {
+		c.Ear.VAD.StopFactor = 1.9
+	}
+	if c.Ear.VAD.MinSpeechMs == 0 {
+		c.Ear.VAD.MinSpeechMs = 320
+	}
+	if c.Ear.VAD.SilenceMs == 0 {
+		c.Ear.VAD.SilenceMs = 1100
+	}
+	if c.Ear.VAD.NoiseLearnS == 0 {
+		c.Ear.VAD.NoiseLearnS = 2
+	}
+
+	// Браузер: CDP-инструмент.
+	if c.Browser.Headless == nil {
+		on := true
+		c.Browser.Headless = &on
+	}
+	if c.Browser.Timeout.Duration == 0 {
+		c.Browser.Timeout.Duration = 60 * time.Second
+	}
+	if c.Browser.MaxTextBytes == 0 {
+		c.Browser.MaxTextBytes = 262_144
+	}
+
 	// Разворачиваем ~ и делаем пути абсолютными.
 	c.Bridge.Remote.KeyPath = expandPath(c.Bridge.Remote.KeyPath)
 	c.Bridge.Remote.KnownHosts = expandPath(c.Bridge.Remote.KnownHosts)
@@ -525,9 +685,9 @@ func (c *Config) Validate() []string {
 	default:
 		errs = append(errs, fmt.Sprintf("voice.stt.convert=%q — допустимо auto|always|never", c.Voice.STT.Convert))
 	}
-	if c.Voice.TTS.Enabled {
+	if c.Voice.TTS.Enabled && c.Voice.TTS.Provider == "openai" {
 		if c.Voice.TTS.BaseURL == "" || c.Voice.TTS.Model == "" {
-			errs = append(errs, "voice.tts.enabled=true — укажи base_url и model")
+			errs = append(errs, "voice.tts.enabled=true (provider=openai) — укажи base_url и model")
 		}
 		switch c.Voice.TTS.Format {
 		case "opus", "mp3", "aac", "flac", "wav", "pcm":
@@ -573,5 +733,60 @@ func (c *Config) Validate() []string {
 			}
 		}
 	}
+	// Failover-цепочка LLM.
+	for i, p := range c.LLM.Providers {
+		if p.BaseURL == "" || p.Model == "" {
+			errs = append(errs, fmt.Sprintf("llm.providers[%d]: base_url и model обязательны", i))
+			continue
+		}
+		if !strings.HasPrefix(p.BaseURL, "http://") && !strings.HasPrefix(p.BaseURL, "https://") {
+			errs = append(errs, fmt.Sprintf("llm.providers[%d].base_url должен начинаться с http:// или https://", i))
+		}
+	}
+
+	// Эмбеддинги памяти.
+	if c.Memory.Embeddings.Enabled {
+		if c.Memory.Embeddings.BaseURL == "" || c.Memory.Embeddings.Model == "" {
+			errs = append(errs, "memory.embeddings.enabled=true — укажи base_url и model")
+		} else if !strings.HasPrefix(c.Memory.Embeddings.BaseURL, "http://") && !strings.HasPrefix(c.Memory.Embeddings.BaseURL, "https://") {
+			errs = append(errs, "memory.embeddings.base_url должен начинаться с http:// или https://")
+		}
+	}
+
+	// TTS-провайдер.
+	switch c.Voice.TTS.Provider {
+	case "openai", "piper":
+	default:
+		errs = append(errs, fmt.Sprintf("voice.tts.provider=%q — допустимо openai|piper", c.Voice.TTS.Provider))
+	}
+	if c.Voice.TTS.Enabled && c.Voice.TTS.Provider == "piper" {
+		if c.Voice.TTS.Piper.Bin == "" || c.Voice.TTS.Piper.Model == "" {
+			errs = append(errs, "voice.tts.provider=piper — укажи piper.bin и piper.model (deploy/setup-piper.sh)")
+		}
+	}
+
+	// Ear: hands-free режим — связки с IPC и STT.
+	if c.Ear.Enabled {
+		if !c.IPC.Enabled {
+			errs = append(errs, "ear.enabled=true требует ipc.enabled=true (команда уходит демону через сокет)")
+		}
+		if !c.Voice.STT.Enabled {
+			errs = append(errs, "ear.enabled=true требует voice.stt.enabled=true")
+		}
+		if c.Ear.MaxUtterance.Duration < 2*time.Second {
+			errs = append(errs, "ear.max_utterance < 2s — слишком коротко для команды")
+		}
+	}
+	if c.Ear.VAD.StartFactor > 0 && c.Ear.VAD.StopFactor > 0 && c.Ear.VAD.StartFactor <= c.Ear.VAD.StopFactor {
+		errs = append(errs, "ear.vad.start_factor должен быть больше stop_factor (гистерезис)")
+	}
+
+	// Observability: адрес должен парситься.
+	if c.Observability.Enabled != nil && *c.Observability.Enabled {
+		if _, _, err := net.SplitHostPort(c.Observability.MetricsAddr); err != nil {
+			errs = append(errs, fmt.Sprintf("observability.metrics_addr %q: %v (формат host:port)", c.Observability.MetricsAddr, err))
+		}
+	}
+
 	return errs
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/archi/archi/internal/bridge"
 	"github.com/archi/archi/internal/config"
+	"github.com/archi/archi/internal/skills"
 )
 
 // ToolBackend — контракт реестра инструментов (реализуется tools.Registry).
@@ -34,6 +35,9 @@ type Agent struct {
 	tz       *time.Location
 	log      *slog.Logger
 
+	skl       *skills.Skills // само-пишущиеся навыки (nil = выключены)
+	sklInject int            // сколько навыков подмешивать в промпт
+
 	// счётчики потребления (для /status и IPC: наблюдаемость без Prometheus)
 	inTokens  atomic.Int64
 	outTokens atomic.Int64
@@ -51,6 +55,16 @@ func New(cfg config.AgentConfig, llm *Client, tools ToolBackend, mem *Memory,
 
 // Sessions открывает менеджер сессий (для /reset в Telegram).
 func (a *Agent) Sessions() *SessionManager { return a.sessions }
+
+// SetSkills подключает каталог само-пишущихся навыков + лимит инъекции в промпт.
+// nil-safe: без вызова агент работает без навыков.
+func (a *Agent) SetSkills(sk *skills.Skills, injectLimit int) {
+	a.skl = sk
+	if injectLimit <= 0 || injectLimit > 4 {
+		injectLimit = 2
+	}
+	a.sklInject = injectLimit
+}
 
 // UsageStats — кумулятивное потребление LLM с старта демона.
 func (a *Agent) UsageStats() (req, inT, outT int64) {
@@ -87,9 +101,11 @@ func (a *Agent) Handle(ctx context.Context, sessionID, userText string) (string,
 // reactLoop — сердце агента: цикл LLM → tool_use → tool_result → … до текста.
 func (a *Agent) reactLoop(ctx context.Context, s *Session) (string, error) {
 	defs := a.tools.Definitions()
-	memHints := a.mem.Recall(lastUserQuery(s), a.memLimit())
+	query := lastUserQuery(s)
+	memHints := a.mem.Recall(query, a.memLimit())
+	sklHints := a.skl.Search(query, a.sklInject)
 
-	repeatGuard := newRepeatGuard(3)
+	repeatGuard := newRepeatGuard(2) // 1-й вызов ок; идентичный повтор — стоп (аудит: пропускались 2)
 	toolSem := make(chan struct{}, max(1, a.cfg.MaxToolParallel))
 
 	for step := 1; step <= a.cfg.MaxSteps; step++ {
@@ -99,7 +115,7 @@ func (a *Agent) reactLoop(ctx context.Context, s *Session) (string, error) {
 		default:
 		}
 
-		system := BuildSystemPrompt(a.tz, a.snap(), memHints)
+		system := BuildSystemPrompt(a.tz, a.snap(), memHints, sklHints)
 		resp, err := a.llm.SendMessage(ctx, system, s.History(), defs)
 		if err != nil {
 			return "", fmt.Errorf("шаг %d: %w", step, err)
@@ -267,5 +283,5 @@ func (g *repeatGuard) seen(call ContentBlock) bool {
 	defer g.mu.Unlock()
 	key := call.Name + "|" + string(call.Input)
 	g.counts[key]++
-	return g.counts[key] >= g.limit
+	return g.counts[key] >= g.limit // limit=2: первый вызов живёт, идентичный повтор — стоп
 }

@@ -18,17 +18,23 @@
   автоперезапуска сервисов на VM.
 - **Инструменты**: `local_bash` / `remote_bash`, `read_file` / `write_file` /
   `list_directory` (с параметром ноды), `systemd_status` / `systemd_restart`,
-  `node_status`, `memory_recall` / `memory_save`, `search_knowledge`.
+  `node_status`, `memory_recall` / `memory_save`, `search_knowledge`,
+  `skill_save` / `skill_read` / `skill_list`, `delegate_task`, `browser`.
 - **Два интерфейса + голос**: Telegram (long polling с защитой от ECONNRESET,
   голосовые сообщения → STT → агент, опциональный голосовой ответ TTS) и
   локальный CLI через UNIX-сокет (`archi ctl "текст"`, `archi voice` —
-  запрос с микрофона с распознаванием и озвучкой ответа).
-- **Голосовой движок** (2026.11): OpenAI-совместимый STT-протокол — работает
+  запрос с микрофона с распознаванием и озвучкой ответа) + hands-free
+  слушатель `archi ear` («Арчи, …» → STT → агент → TTS).
+- **Голосовой движок** (2026.11–2026.13): OpenAI-совместимый STT-протокол — работает
   с Groq `whisper-large-v3-turbo`, OpenAI `whisper-1` и локальным
   whisper.cpp server без изменения кода; микрофон через arecord/ffmpeg/parecord;
-  ноль CGO — статическая сборка сохранена.
-- **Долговременная память**: JSONL + keyword-recall + компактизация истории
-  (LLM-сводка при переполнении контекста).
+  TTS — облако (OpenAI/Groq) или локальный Piper (офлайн); ноль CGO —
+  статическая сборка сохранена.
+- **Долговременная память**: JSONL + гибридный recall (keyword + опциональные
+  эмбеддинги через OpenAI-совместимый /embeddings) + компактизация истории
+  (LLM-сводка при переполнении контекста) + само-пишущиеся навыки.
+- **Observability**: Prometheus text-эндпоинт `/metrics` + `/healthz` на
+  localhost (127.0.0.1:9109), счётчики запросов/токенов/инструментов.
 - **Zero-dependency**: один статический бинарник ~8 МБ, только stdlib +
   `golang.org/x/crypto` (SSH) + `gopkg.in/yaml.v3`.
 
@@ -84,8 +90,9 @@
 
 ```bash
 # требуется Go 1.22+
-make build          # → bin/archi (статический, ~8 МБ)
+make build          # → bin/archi (статический, ~8.8 МБ)
 make vet            # go vet
+make test           # 7 пакетов тестов (включая VAD/wake-word/skills/metrics)
 make check          # валидация deploy/config.yaml
 ```
 
@@ -111,6 +118,21 @@ make check          # валидация deploy/config.yaml
    ```
    и в `/etc/archi/config.yaml` → `telegram.allowed: [твой-telegram-id]`.
 5. **Запуск**: `systemctl status archi`, логи: `journalctl -u archi -f`.
+6. **Опционально — голос**:
+   ```bash
+   # STT: ключ Groq в /etc/archi/archi.env (GROQ_API_KEY=...) + voice.stt.enabled: true
+   # Локальный фолбэк STT (офлайн): deploy/archi-whisper.service — см. шапку юнита
+
+   # Офлайн-озвучка Piper (голоса ru: irina/ruslan/dmitri):
+   sudo bash deploy/setup-piper.sh            # поставит /opt/piper + голос
+   # → в конфиге: voice.tts.provider: piper
+
+   # Hands-free «Арчи, …» (требует stt + tts):
+   # в конфиге ear.enabled: true, затем:
+   sudo cp deploy/archi-ear.service /etc/systemd/system/
+   sudo systemctl daemon-reload && sudo systemctl enable --now archi-ear
+   journalctl -u archi-ear -f
+   ```
 
 ## Использование
 
@@ -121,6 +143,7 @@ archi ctl "проверь логи console-bot на сервере за посл
 archi ctl --reset           # сброс контекста IPC-сессии
 archi voice                 # голосом с микрофона: запись → STT → агент → ответ
 archi voice --speak         # то же + озвучка ответа (нужен voice.tts.enabled)
+archi ear                   # hands-free демон «Арчи, …» (скрыт от терминала: systemd)
 
 # в Telegram:
 /status   — состояние узлов
@@ -159,27 +182,38 @@ archi/
 │   │   ├── alerts.go           #   Alerter: пороги + cooldown-дедупликация
 │   │   └── bridge.go           #   оркестратор: цикл, снапшот, watchdog, подписчики
 │   ├── agent/                  # МОДУЛЬ 2: archicore
-│   │   ├── llm.go              #   клиент /v1/messages (Anthropic Tools API)
+│   │   ├── llm.go              #   клиент /v1/messages (Anthropic Tools API) + failover
 │   │   ├── agent.go            #   ReAct-цикл, параллельные инструменты, compact()
-│   │   ├── session.go          #   сессии с LRU-вытеснением
-│   │   ├── memory.go           #   JSONL-память + recall + skills-каталог
-│   │   └── prompt.go           #   системный промпт с живой телеметрией
+│   │   ├── session.go           #   сессии с LRU-вытеснением
+│   │   ├── memory.go            #   JSONL-память: гибридный recall + компакция
+│   │   ├── embed.go             #   /embeddings-векторизатор + косинус
+│   │   └── prompt.go            #   системный промпт с живой телеметрией
 │   ├── tools/                  # реестр инструментов
-│   │   ├── registry.go         #   JSON Schema, таймауты, паник-гард, лимит вывода
-│   │   ├── bash.go              #   local_bash / remote_bash + санитайзер
-│   │   ├── fs.go               #   read/write/list с нодой, base64-передача на VM
-│   │   ├── systemd.go           #   systemd_status / systemd_restart / node_status
-│   │   └── knowledge.go         #   memory_* / search_knowledge
+│   │   ├── registry.go          #   JSON Schema, таймауты, паник-гард, лимит вывода
+│   │   ├── bash.go             #   local_bash / remote_bash + санитайзер
+│   │   ├── fs.go                #   read/write/list с нодой, base64-передача на VM
+│   │   ├── systemd.go          #   systemd_status / systemd_restart / node_status
+│   │   ├── knowledge.go         #   memory_* / search_knowledge
+│   │   ├── approval.go         #   политика: deny → approval → исполнение
+│   │   ├── skills.go            #   skill_save / skill_read / skill_list
+│   │   ├── subagent.go         #   delegate_task (чистый контекст, глубина ≤1)
+│   │   └── browser.go           #   CDP: headless Chromium, текст + скриншоты
+│   ├── skills/                 # каталог само-пишущихся навыков (markdown)
+│   ├── metrics/                # Prometheus text-эндпоинт (лёгкие счётчики)
+│   ├── cron/                   # движок проактивности (every/times + nudge)
 │   ├── telegram/               # МОДУЛЬ 3a: Telegram-раннер
 │   │   ├── bot.go              #   собственный polling-клиент (anti-ECONNRESET)
-│   │   └── runner.go            #   команды, тревоги, сводки 09:00/21:00
+│   │   └── runner.go           #   команды, тревоги, сводки, approval-клавиатуры
 │   └── ipc/                    # МОДУЛЬ 3b: локальный интерфейс
 │       ├── server.go           #   UNIX-сокет, line-JSON, мульти-запросы
-│       └── cli.go              #   клиент `archi ctl`
+│       └── cli.go              #   клиент `archi ctl` (+ тихий режим для ear)
 ├── deploy/
 │   ├── config.yaml             # эталонный конфиг
 │   ├── archi.service           # systemd-юнит демона
-│   └── archi-tunnel.service    # systemd-юнит SSH-туннеля к LLM-прокси
+│   ├── archi-ear.service       # systemd-юнит hands-free слушателя
+│   ├── archi-tunnel.service    # systemd-юнит SSH-туннеля к LLM-прокси
+│   ├── archi-whisper.service   # локальный whisper.cpp-фолбэк STT
+│   └── setup-piper.sh          # установка офлайн-TTS Piper + ru-голосов
 ├── Makefile
 └── README.md
 ```
@@ -191,6 +225,39 @@ archi/
 - Бинарник: ~8 МБ статик (CGO_ENABLED=0), старт < 100 мс.
 - Локальный whisper-фолбэк (если поднят archi-whisper.service): ~600 МБ в работе,
   0 в простое при выключенном юните — фолбэк просто не сработает и вернётся ошибка основного провайдера.
+
+## Возможности 2026.13 «Эталон 2026»
+
+GAP-анализ к эталонным агентам 2025–2026 (Hermes, Claude Code, OpenClaw) закрыт
+ещё на шесть плоскостей:
+
+- **Hands-free голос** (`internal/voice/ear.go` + `archi ear` + archi-ear.service):
+  энергийный RMS-VAD с адаптивным шумовым полом и гистерезисом, pre-roll,
+  wake-word «арчи»/«archi» с Левенштейн-допуском опечаток (≤1), полудуплекс
+  с barge-in (громкая речь перебивает озвучку), анти-эхо cooldown. Голый
+  wake-word активирует следующую фразу («— Арчи. — Да?»). Требует IPC + STT.
+- **Само-пишущиеся навыки** (`internal/skills` + `skill_save`/`skill_read`/
+  `skill_list`): удачные процедуры агент сохраняет в `memory/skills/*.md`,
+  релевантные подмешиваются в системный промпт (поиск по заголовку ×3 /
+  тегам ×2 / телу ×1). Паттерн Hermes self-improvement.
+- **Субагенты** (`delegate_task`): длинные разведки уходят в чистый контекст
+  (своя сессия `sub:<ts>`), вывод возвращается сжатым — диалог не раздувается.
+  Вложенное делегирование запрещено (глубина ≤1).
+- **Векторный recall памяти**: записи векторизуются OpenAI-совместимым
+  /embeddings (вектор хранится прямо в JSONL), скоринг гибридный —
+  2.5×косинус + keyword-бонус + свежесть. Без ключей работает как раньше.
+- **Браузерный инструмент** (`browser`, `internal/tools/browser.go`):
+  single-shot headless Chromium по CDP (собственный WS-клиент) — текст
+  JS-отрендеренной страницы + JPEG-скриншоты в `<data_dir>/browser/`.
+  Никаких библиотек — только stdlib + x/net/websocket.
+- **Observability**: Prometheus-эндпоинт `archi_llm_requests_total`,
+  `archi_llm_tokens_total`, `archi_tool_calls_total{tool,result}` и др. на
+  127.0.0.1:9109 (config: `observability`).
+- **Локальный TTS Piper**: provider `piper` — офлайн-синтез (бинарь +
+  ru_RU-голоса: irina/ruslan/dmitri, ставит `deploy/setup-piper.sh`),
+  автоконвертация в opus для Telegram sendVoice.
+- **LLM-failover**: цепочка `llm.providers` — после исчерпания ретраев
+  основного запрос уходит к резервному провайдеру той же формы.
 
 ## Возможности 2026.12 «Автономность»
 
@@ -221,10 +288,12 @@ archi/
 - [x] ~~Проактивность: cron-задания~~ (2026.12)
 - [x] ~~Approval перед side-effects~~ (2026.12)
 - [x] ~~Usage-счётчики токенов~~ (2026.12)
+- [x] ~~Векторный recall памяти~~ (2026.13, /embeddings + косинус)
+- [x] ~~Hands-free «Арчи, …»~~ (2026.13, RMS-VAD + wake-word; Silero/openWakeWord —
+      следующий шаг точности, интерфейс VAD готов)
+- [x] ~~Локальный TTS Piper ru_RU~~ (2026.13, provider: piper)
+- [x] ~~Метрики Prometheus~~ (2026.13, /metrics на localhost)
 - [ ] `send_file` / `generate_photo` (Gemini) — перенос из старого бота.
-- [ ] Векторный recall вместо keyword-поиска (sqlite-vec или чистый Go).
-- [ ] Hands-free «Hey Archi»: Silero VAD + openWakeWord + ring-buffer
-      (archi-ear.service; CPU-бюджет ~5% ядра).
-- [ ] Локальный TTS Piper ru_RU для озвучки по умолчанию.
+- [ ] Semantic VAD (Silero) + openWakeWord «hey archi» — точность вместо RMS-эмпирики.
+- [ ] Дуплекс-режим голоса (WebSocket-стриминг STT/TTS) как Realtime-эталон.
 - [ ] Webhook-режим Telegram как альтернатива polling.
-- [ ] Метрики в Prometheus text format на localhost:9101.

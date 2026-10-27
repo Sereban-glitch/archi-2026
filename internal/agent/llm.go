@@ -84,10 +84,11 @@ type Request struct {
 // Client — HTTP-клиент к antigravity-claude-proxy (Anthropic Messages API).
 // Отказоустойчивость: экспоненциальный backoff + джиттер на 429/5xx/сетевых
 // ошибках (включая ECONNRESET — бич node-телеграм-ботов и прокси), honor Retry-After.
+// Failover (self-healing, 2027.1): когда основной провайдер исчерпал ретраи,
+// запрос уходит по цепочке llm.providers — агент не ложится вместе с одним прокси.
 type Client struct {
-	base                    string
-	key                     string
-	model                   string
+	primary                 providerTarget
+	fallbacks               []providerTarget
 	maxTokens               int
 	maxRetries              int
 	backoffBase, backoffMax time.Duration
@@ -95,7 +96,14 @@ type Client struct {
 	log                     *slog.Logger
 }
 
-// NewClient создаёт LLM-клиент.
+// providerTarget — один Anthropic-совместимый endpoint цепочки.
+type providerTarget struct {
+	base  string
+	key   string
+	model string
+}
+
+// NewClient создаёт LLM-клиент с опциональной failover-цепочкой.
 func NewClient(cfg config.LLMConfig, log *slog.Logger) *Client {
 	tr := &http.Transport{
 		MaxIdleConns:        4,
@@ -104,10 +112,12 @@ func NewClient(cfg config.LLMConfig, log *slog.Logger) *Client {
 		DialContext:         (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
-	return &Client{
-		base:        strings.TrimRight(cfg.BaseURL, "/"),
-		key:         cfg.APIKey,
-		model:       cfg.Model,
+	c := &Client{
+		primary: providerTarget{
+			base:  strings.TrimRight(cfg.BaseURL, "/"),
+			key:   cfg.APIKey,
+			model: cfg.Model,
+		},
 		maxTokens:   cfg.MaxTokens,
 		maxRetries:  cfg.MaxRetries,
 		backoffBase: 1 * time.Second,
@@ -115,15 +125,57 @@ func NewClient(cfg config.LLMConfig, log *slog.Logger) *Client {
 		http:        &http.Client{Transport: tr},
 		log:         log,
 	}
+	for _, p := range cfg.Providers {
+		if p.BaseURL == "" || p.Model == "" {
+			continue // валидатор уже ругнулся; здесь просто не падаем
+		}
+		key := p.APIKey
+		if key == "" {
+			key = cfg.APIKey // наследуем ключ основного, если не задан
+		}
+		c.fallbacks = append(c.fallbacks, providerTarget{
+			base:  strings.TrimRight(p.BaseURL, "/"),
+			key:   key,
+			model: p.Model,
+		})
+	}
+	return c
 }
 
-// Model возвращает имя модели.
-func (c *Client) Model() string { return c.model }
+// Model возвращает имя основной модели.
+func (c *Client) Model() string { return c.primary.model }
 
-// SendMessage выполняет запрос к модели с ретраями. Системный таймаут — через ctx.
+// Providers возвращает размер failover-цепочки (0 = только основной).
+func (c *Client) Providers() int { return 1 + len(c.fallbacks) }
+
+// SendMessage выполняет запрос к модели с ретраями и failover-цепочкой.
+// Системный таймаут — через ctx.
 func (c *Client) SendMessage(ctx context.Context, system string, messages []Message, tools []map[string]any) (*Response, error) {
+	targets := append([]providerTarget{c.primary}, c.fallbacks...)
+	var errs []error
+	for ti, tgt := range targets {
+		resp, err := c.sendTo(ctx, tgt, system, messages, tools)
+		if err == nil {
+			if ti > 0 {
+				c.log.Warn("llm: ответил резервный провайдер (failover)", "provider", tgt.base, "model", tgt.model)
+			}
+			return resp, nil
+		}
+		errs = append(errs, fmt.Errorf("провайдер %d (%s): %w", ti+1, tgt.base, err))
+		if ctx.Err() != nil {
+			break // отменять цепочку по ctx — правильно (крони/таймауты важнее)
+		}
+		if len(targets) > 1 {
+			c.log.Warn("llm: провайдер не ответил, пробую следующий", "provider", tgt.base, "err", err.Error())
+		}
+	}
+	return nil, fmt.Errorf("llm: все провайдеры недоступны (%d): %w", len(errs), errors.Join(errs...))
+}
+
+// sendTo — запросы к одному провайдеру с ретраями.
+func (c *Client) sendTo(ctx context.Context, tgt providerTarget, system string, messages []Message, tools []map[string]any) (*Response, error) {
 	reqBody, err := json.Marshal(Request{
-		Model:     c.model,
+		Model:     tgt.model,
 		MaxTokens: c.maxTokens,
 		System:    system,
 		Messages:  messages,
@@ -142,7 +194,7 @@ func (c *Client) SendMessage(ctx context.Context, system string, messages []Mess
 				return nil, ctx.Err()
 			}
 		}
-		resp, apiErr, retryAfter, err := c.post(ctx, reqBody)
+		resp, apiErr, retryAfter, err := c.post(ctx, tgt, reqBody)
 		if err == nil {
 			return resp, nil
 		}
@@ -157,19 +209,19 @@ func (c *Client) SendMessage(ctx context.Context, system string, messages []Mess
 				return nil, ctx.Err()
 			}
 		}
-		c.log.Warn("llm: повтор запроса", "attempt", attempt+1, "retry_after", retryAfter.String(), "err", err.Error())
+		c.log.Warn("llm: повтор запроса", "provider", tgt.base, "attempt", attempt+1, "retry_after", retryAfter.String(), "err", err.Error())
 	}
 	return nil, fmt.Errorf("llm: исчерпаны попытки (%d): %w", c.maxRetries+1, lastErr)
 }
 
-// post — одна HTTP-попытка. Возвращает (ответ, apiErr, retryAfter, error).
-func (c *Client) post(ctx context.Context, body []byte) (*Response, *apiError, time.Duration, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/v1/messages", bytes.NewReader(body))
+// post — одна HTTP-попытка к провайдеру tgt. Возвращает (ответ, apiErr, retryAfter, error).
+func (c *Client) post(ctx context.Context, tgt providerTarget, body []byte) (*Response, *apiError, time.Duration, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tgt.base+"/v1/messages", bytes.NewReader(body))
 	if err != nil {
 		return nil, nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", c.key)
+	req.Header.Set("x-api-key", tgt.key)
 	req.Header.Set("anthropic-version", "2023-06-01")
 
 	resp, err := c.http.Do(req)

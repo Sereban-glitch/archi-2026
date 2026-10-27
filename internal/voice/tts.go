@@ -16,6 +16,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -52,8 +54,110 @@ func PlainText(s string) string {
 	return strings.NewReplacer("*", "", "`", "", "_", "", "#", "", ">", "").Replace(s)
 }
 
-// Synthesize превращает текст в аудио (формат — по конфигу, обычно OGG/Opus).
+// Synthesize превращает текст в аудио. Провайдер piper — локальный офлайн-синтез
+// (бинарь + .onnx-голос, см. deploy/setup-piper.sh), всё остальное —
+// OpenAI-совместимый /audio/speech (облако).
 func (s *Synthesizer) Synthesize(ctx context.Context, text string) ([]byte, error) {
+	if s == nil {
+		return nil, errors.New("tts отключён")
+	}
+	if strings.EqualFold(strings.TrimSpace(s.cfg.Provider), "piper") {
+		return s.synthesizePiper(ctx, text)
+	}
+	return s.synthesizeHTTP(ctx, text)
+}
+
+// synthesizePiper — локальный синтез: текст на stdin бинарю, WAV в temp-файл,
+// затем конвертация под целевой формат (Telegram любит opus).
+func (s *Synthesizer) synthesizePiper(ctx context.Context, text string) ([]byte, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, errors.New("пустой текст")
+	}
+	timeout := s.cfg.Piper.Timeout.Duration
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	tmp, err := writeTemp(nil, ".wav")
+	if err != nil {
+		return nil, err
+	}
+	defer removeTemp(tmp)
+
+	cmd := exec.CommandContext(cctx, s.cfg.Piper.Bin, "--model", s.cfg.Piper.Model, "--output_file", tmp)
+	cmd.Stdin = strings.NewReader(text)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("piper: %w%s", err, suffixMsg(clipB(stderr.Bytes(), 200)))
+	}
+	wav, err := os.ReadFile(tmp)
+	if err != nil {
+		return nil, fmt.Errorf("piper: чтение результата: %w", err)
+	}
+	if len(wav) < 44 {
+		return nil, errors.New("piper: пустой результат")
+	}
+	fmt := strings.ToLower(s.cfg.Format)
+	if fmt == "" || fmt == "wav" {
+		return wav, nil
+	}
+	// Целевой формат — конвертируем (без ffmpeg отдаём WAV как есть).
+	out, cerr := ffmpegConvertAudio(cctx, wav, "."+fmt)
+	if cerr != nil {
+		s.log.Warn("tts: piper-конвертация не удалась, отдаю WAV", "err", cerr)
+		return wav, nil
+	}
+	return out, nil
+}
+
+// ffmpegConvertAudio конвертирует аудио-байты в целевой формат через ffmpeg.
+func ffmpegConvertAudio(ctx context.Context, audio []byte, ext string) ([]byte, error) {
+	if _, err := lookCommand("ffmpeg"); err != nil {
+		return nil, errors.New("ffmpeg не установлен")
+	}
+	src, err := writeTemp(audio, ".wav")
+	if err != nil {
+		return nil, err
+	}
+	defer removeTemp(src)
+	dst := strings.TrimSuffix(src, ".wav") + ext
+	var codec string
+	switch strings.ToLower(ext) {
+	case ".opus", ".oga", ".ogg":
+		codec = "libopus"
+	case ".mp3":
+		codec = "libmp3lame"
+	case ".aac", ".m4a":
+		codec = "aac"
+	case ".flac":
+		codec = "flac"
+	case ".raw", ".pcm":
+		codec = "pcm_s16le"
+	default:
+		return nil, fmt.Errorf("неподдерживаемый формат конвертации %q", ext)
+	}
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+		"-i", src, "-c:a", codec, "-b:a", "48k", dst)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		_ = os.Remove(dst)
+		return nil, fmt.Errorf("ffmpeg: %w%s", err, suffixMsg(clipB(stderr.Bytes(), 200)))
+	}
+	out, err := os.ReadFile(dst)
+	_ = os.Remove(dst)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// synthesizeHTTP — облачный синтез через OpenAI-совместимый /audio/speech.
+func (s *Synthesizer) synthesizeHTTP(ctx context.Context, text string) ([]byte, error) {
 	if s == nil {
 		return nil, errors.New("tts отключён")
 	}

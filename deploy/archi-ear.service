@@ -1,0 +1,62 @@
+# ============================================================
+# archi-ear.service — hands-free слушатель «Арчи, …» (ноутбук)
+#
+# Отдельный процесс от основного демона: микрофонный цикл не умирает
+# при рестарте archi, а неудача слушателя не роняет агента.
+# Требует: ear.enabled=true, ipc.enabled=true, voice.stt.enabled=true
+# (валидация check-config это проверит) и доступ к /run/archi/archi.sock.
+#
+# Установка:
+#   sudo cp archi-ear.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now archi-ear
+#   journalctl -u archi-ear -f     — смотреть, что слышит агент
+# ============================================================
+
+[Unit]
+Description=Archi 2026 — hands-free слушатель (wake-word «Арчи», VAD, STT)
+Documentation=file:///home/archi/archi/README.md
+After=network-online.target archi.service
+Wants=network-online.target
+Requires=archi.service
+
+[Service]
+Type=simple
+User=archi
+Group=archi
+
+ExecStart=/usr/local/bin/archi ear --config /etc/archi/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Слушателю нужен доступ к аудио-устройству и IPC-сокету демона.
+SupplementaryGroups=audio
+ReadWritePaths=/run/archi
+
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Ресурсы: VAD лёгкий, но потолок не помешает.
+MemoryMax=256M
+CPUWeight=30
+
+LimitNOFILE=4096
+TasksMax=32
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+EnvironmentFile=-/etc/archi/archi.env
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=archi-ear
+
+[Install]
+WantedBy=multi-user.target

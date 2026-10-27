@@ -17,6 +17,12 @@ llm:
   max_tokens: 4096
   timeout: 120s
   max_retries: 4
+  # Failover-цепочка (2026.13): когда основной исчерпал ретраи, запрос уходит
+  # сюда — другая точка входа той же Anthropic-совместимой формы.
+  # providers:
+  #   - base_url: https://api.anthropic.com
+  #     api_key: ${ANTHROPIC_API_KEY:-}
+  #     model: claude-sonnet-4-5
 
 # ---------- Ядро ReAct ----------
 agent:
@@ -137,6 +143,36 @@ memory:
   dir: /var/lib/archi/memory   # memory.jsonl + skills/
   recall_limit: 8
   max_entries: 5000
+  # Семантический recall: векторы записей через OpenAI-совместимый /embeddings.
+  # Выключено — работает гибридный keyword-recall (как раньше).
+  embeddings:
+    enabled: false
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY:-}
+    model: text-embedding-3-small
+    timeout: 15s
+
+# ---------- Само-пишущиеся навыки (2026.13) ----------
+# Агент сохраняет удачные процедуры (skill_save) в memory/skills/*.md
+# и переиспользует их: релевантные подмешиваются в системный промпт.
+skills:
+  enabled: true
+  inject_limit: 2              # сколько навыков подмешивать в промпт
+
+# ---------- Observability (2026.13) ----------
+# Prometheus-текстовый эндпоинт + healthcheck. Только localhost!
+observability:
+  enabled: true
+  metrics_addr: 127.0.0.1:9109  # curl 127.0.0.1:9109/metrics
+
+# ---------- Браузерный инструмент (2026.13) ----------
+# Headless Chromium через CDP: JS-рендеринг + скриншоты для SPA-дашбордов.
+# Требует: sudo apt install chromium-browser (или chrome_bin явно).
+browser:
+  enabled: false
+  chrome_bin: ""              # "" = авто-детект chromium/google-chrome
+  timeout: 60s
+  max_text_bytes: 262144
 
 # ---------- Голосовой интерфейс (2026.12) ----------
 # STT — OpenAI-совместимый POST {base_url}/audio/transcriptions (multipart).
@@ -162,24 +198,50 @@ voice:
       convert: auto             # localhost → сам сконвертирует в WAV 16кГц
       timeout: 120s            # локальному на i5-6200U нужно 3-5x realtime
 
-  # TTS — опциональная озвучка ответов (OpenAI-совместимый /audio/speech).
-  # Формат opus → отправляется в Telegram как голосовое (sendVoice).
-  tts:
-    enabled: false
-    base_url: https://api.openai.com/v1
-    api_key: ${OPENAI_API_KEY:-}
-    model: gpt-4o-mini-tts
-    voice: alloy
-    format: opus
-    timeout: 60s
-    max_chars: 1000             # более длинные ответы не озвучиваются
-
   # Микрофон ноутбука — для команды `archi voice`.
   mic:
     backend: auto               # auto|arecord|ffmpeg|parecord
     device: default             # default | hw:0,0 | имя pulse-источника
     sample_rate: 16000         # то, что любит Whisper
     max_duration: 120s         # protect-таймер от забытой записи
+
+  # TTS — опциональная озвучка ответов.
+  # Провайдер openai (облако, /audio/speech) или piper (локальный офлайн,
+  # ставится скриптом deploy/setup-piper.sh; голоса: irina / ruslan / dmitri).
+  # Формат opus → отправляется в Telegram как голосовое (sendVoice).
+  tts:
+    enabled: false
+    provider: openai            # openai | piper
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY:-}
+    model: gpt-4o-mini-tts
+    voice: alloy                # для piper не используется
+    format: opus
+    timeout: 60s
+    max_chars: 1000             # более длинные ответы не озвучиваются
+    piper:                      # используется только при provider: piper
+      bin: /opt/piper/piper
+      model: /opt/piper/ru_RU-irina-medium.onnx
+      timeout: 30s
+
+# ---------- Ear: hands-free голос (2026.13) ----------
+# Отдельный слушатель `archi ear` (deploy/archi-ear.service): ловит «Арчи, …»
+# в эфире, шлёт команду демону через IPC и отвечает голосом (нужен TTS).
+# Полудуплекс с barge-in: громкая речь перебивает озвучку.
+# Требует: ipc.enabled=true + voice.stt.enabled=true (проверяет check-config).
+ear:
+  enabled: false               # включи вместе с archi-ear.service
+  wake_words: ["арчи", "archi"]
+  max_utterance: 20s           # жёсткий лимит фразы
+  cooldown: 4s                 # анти-эхо после собственного ответа
+  barge_in: true               # перебивать озвучку громкой речью
+  vad:                         # энергия-RMS: без моделей, чистый Go
+    frame_ms: 30               # окно анализа
+    start_factor: 3.2          # RMS > пол×фактор → речь началась
+    stop_factor: 1.9           # RMS < пол×фактор → тишина
+    min_speech_ms: 320          # короче — клик/шум, не фраза
+    silence_ms: 1100            # тишина, закрывающая фразу
+    noise_learn_s: 2            # калибровка шума при старте (сек)
 
 # ---------- Cron: проактивные задания агента (2026.12) ----------
 # Агент сам просыпается по расписанию и выполняет задачу через полный ReAct-цикл.
