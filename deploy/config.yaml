@@ -232,6 +232,15 @@ voice:
 ear:
   enabled: false               # включи вместе с archi-ear.service
   wake_words: ["арчи", "archi"]
+  # Как ловить wake-word (2026.14 «Уши»):
+  #   stt  — по транскрипту STT (нужен работающий voice.stt; было до 2026.14)
+  #   dtw  — офлайн-шаблоны твоего голоса: archi ear --train-wake, затем сюда dtw
+  #   both — dtw ИЛИ stt (максимальная отзывчивость)
+  #   http — сайдкар с моделью openWakeWord/livekit-wakeword (deploy/wake_server.py;
+  #          модель «Арчи» за <1 часа: openwakeword.com)
+  wake_engine: stt
+  # wake_threshold: 6.5          # только для dtw; 0/не задан = порог из wake-templates.json
+  # wake_server_url: http://127.0.0.1:8079/wake   # только для wake_engine: http
   max_utterance: 20s           # жёсткий лимит фразы
   cooldown: 4s                 # анти-эхо после собственного ответа
   barge_in: true               # перебивать озвучку громкой речью

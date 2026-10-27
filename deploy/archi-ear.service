@@ -1,10 +1,17 @@
 # ============================================================
 # archi-ear.service — hands-free слушатель «Арчи, …» (ноутбук)
 #
+# ⚠️ ГЛАВНАЯ ПРИЧИНА «НЕ СЛЫШИТ»: PipeWire/PulseAudio живут в СЕССИИ
+# пользователя, а системный юнит её не видит — дефолтный микрофон
+# недоступен. Ниже уже прописан Environment=XDG_RUNTIME_DIR=/run/user/1000
+# (uid первого пользователя Linux Mint; проверь свой: id -u).
+# Если не заработает — запускай юнитом ПОЛЬЗОВАТЕЛЯ (archi-ear-user.service),
+# это самый надёжный путь на ноутбуке.
+#
 # Отдельный процесс от основного демона: микрофонный цикл не умирает
 # при рестарте archi, а неудача слушателя не роняет агента.
 # Требует: ear.enabled=true, ipc.enabled=true, voice.stt.enabled=true
-# (валидация check-config это проверит) и доступ к /run/archi/archi.sock.
+# и доступ к /run/archi/archi.sock. Диагностика: archi ear --test.
 #
 # Установка:
 #   sudo cp archi-ear.service /etc/systemd/system/
@@ -25,12 +32,20 @@ Type=simple
 User=archi
 Group=archi
 
+# Доступ к сессии PipeWire пользователя (uid 1000 — первый пользователь Mint;
+# проверь: id -u). Без этой строки микрофон через дефолтное устройство недоступен!
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+# Если сокет PipeWire закрыт для чужого пользователя — либо добавь archi
+# в группу владельца сокета, либо задай ear.device=plughw:... (arecord -L),
+# либо переходи на archi-ear-user.service (юнит пользователя).
+
 ExecStart=/usr/local/bin/archi ear --config /etc/archi/config.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 
-# Слушателю нужен доступ к аудио-устройству и IPC-сокету демона.
+# Слушателю нужен доступ к аудио-устройству, IPC-сокету демона и сокету
+# сессии PipeWire (подключение к сокету = запись в него).
 SupplementaryGroups=audio
-ReadWritePaths=/run/archi
+ReadWritePaths=/run/archi /run/user/1000
 
 Restart=always
 RestartSec=10

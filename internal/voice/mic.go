@@ -118,12 +118,19 @@ func RecordInteractive(ctx context.Context, cfg config.VoiceMicConfig, log *slog
 }
 
 // resolveBackend выбирает бэкенд записи: явно или авто-пробелом по PATH.
+// В авто-режиме при живой сессии PipeWire/PulseAudio (XDG_RUNTIME_DIR/PULSE_SERVER)
+// предпочитаем parecord: он берёт ИМЕННО выбранный в системе микрофон, тогда как
+// дефолт ALSA может указывать не туда (или в никуда — если сессии нет).
 func resolveBackend(cfgBackend string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(cfgBackend)) {
 	case "arecord", "ffmpeg", "parecord":
 		return strings.ToLower(cfgBackend), nil
 	case "", "auto":
-		for _, cand := range []string{"arecord", "ffmpeg", "parecord"} {
+		order := []string{"arecord", "ffmpeg", "parecord"}
+		if os.Getenv("XDG_RUNTIME_DIR") != "" || os.Getenv("PULSE_SERVER") != "" {
+			order = []string{"parecord", "arecord", "ffmpeg"}
+		}
+		for _, cand := range order {
 			if _, err := lookCommand(cand); err == nil {
 				return cand, nil
 			}
@@ -146,8 +153,12 @@ func recorderCommand(backend, device string, rate int, tmp string) (*exec.Cmd, e
 			"-ar", strconv.Itoa(rate), "-ac", "1", tmp), nil
 	case "parecord":
 		// parecord: формат вывода задаётся расширением файла (.wav).
-		return exec.Command("parecord", "--rate", strconv.Itoa(rate),
-			"--channels", "1", "--file-format=wav", tmp), nil
+		args := []string{"--rate", strconv.Itoa(rate), "--channels", "1", "--file-format=wav"}
+		if device != "" && device != "default" {
+			args = append(args, "--device="+device)
+		}
+		args = append(args, tmp)
+		return exec.Command("parecord", args...), nil
 	}
 	return nil, fmt.Errorf("нет сборки команды для бэкенда %q", backend)
 }

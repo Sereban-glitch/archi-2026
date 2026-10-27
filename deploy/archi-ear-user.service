@@ -1,0 +1,38 @@
+# ============================================================
+# archi-ear-user.service — РЕКОМЕНДУЕМЫЙ способ запуска ушей на ноутбуке.
+#
+# Юнит ПОЛЬЗОВАТЕЛЯ: работает в твоей сессии, видит PipeWire/PulseWire,
+# дефолтный микрофон и выбранный источник ввода — без танцев с XDG_RUNTIME_DIR.
+#
+# Установка:
+#   mkdir -p ~/.config/systemd/user
+#   cp archi-ear-user.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now archi-ear
+#   journalctl --user -u archi-ear -f
+#   loginctl enable-linger $USER   # чтобы слушатель жил и без логина
+#
+# Конфиг: ~/.config/archi/config.yaml (символьная ссылка на /etc/archi/config.yaml
+# тоже подойдёт: ln -s /etc/archi/config.yaml ~/.config/archi/config.yaml).
+#
+# Доступ к IPC-сокету демона (/run/archi/archi.sock, 0660 archi:archi):
+#   sudo usermod -aG archi $USER   # и перелогинься
+# ============================================================
+
+[Unit]
+Description=Archi 2026 — hands-free слушатель (юнит пользователя, PipeWire-сессия)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/archi ear --config %h/.config/archi/config.yaml
+Restart=always
+RestartSec=5
+
+# Уши лёгкие, но потолок не помешает.
+MemoryMax=256M
+CPUWeight=30
+
+[Install]
+WantedBy=default.target

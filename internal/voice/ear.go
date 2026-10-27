@@ -2,17 +2,19 @@
 //
 // Отдельный процесс `archi ear` (deploy/archi-ear.service): непрерывно слушает
 // микрофон, детектирует речь энергией (RMS-VAD с адаптивным шумовым полом),
-// распознаёт короткие фразы через STT-цепочку и, услышав wake-word («арчи»),
-// отправляет команду демону через IPC и отвечает голосом (TTS).
+// ловит wake-word и отправляет команду демону через IPC, отвечает голосом (TTS).
 //
-// Почему VAD на энергии, а не Silero: чистый Go, ноль моделей и зависимостей,
-// на i5-6200U почти не ест CPU; Silero/openWakeWord — следующий шаг, интерфейс
-// VAD-стейт-машины (feed кадра → события) это позволяет.
+// Движки wake-word (ear.wake_engine):
+//   - stt  — классика: фраза → STT → совпадение первого слова (нужен STT-провайдер);
+//   - dtw  — офлайн: MFCC+DTW по шаблонам голоса владельца (archi ear --train-wake),
+//     ноль зависимостей, работает без сети и ключей;
+//   - http — сайдкар с моделью openWakeWord/livekit-wakeword (deploy/wake_server.py),
+//     «Арчи» натренировывается на openwakeword.com за <1 часа;
+//   - both — dtw ИЛИ stt (максимальная отзывчивость).
 //
 // Полудуплекс с barge-in: во время озвучки ответа кадры НЕ кормят основной VAD
-// (эхо динамика не портит шумовой пол и не собирается в «фразы»), но громкая
-// устойчивая речь сверх отдельного порога прерывает плеер — пользователь
-// может перебить агента. После ответа действует cooldown — анти-эхо пауза.
+// (эхо динамика не портит шумовой пол), но громкая устойчивая речь сверх
+// отдельного порога прерывает плеер. После ответа действует cooldown — анти-эхо.
 package voice
 
 import (
@@ -23,6 +25,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -224,45 +227,86 @@ func wrapWAV(pcm []byte, rate int) []byte {
 	copy(hdr[8:], "WAVE")
 	copy(hdr[12:], "fmt ")
 	binary.LittleEndian.PutUint32(hdr[16:], 16)
-	binary.LittleEndian.PutUint16(hdr[20:], 1)              // PCM
-	binary.LittleEndian.PutUint16(hdr[22:], 1)              // mono
-	binary.LittleEndian.PutUint32(hdr[24:], uint32(rate))   // rate
-	binary.LittleEndian.PutUint32(hdr[28:], uint32(rate*2)) // bytes/sec
-	binary.LittleEndian.PutUint16(hdr[32:], 2)              // block align
-	binary.LittleEndian.PutUint16(hdr[34:], 16)             // bits
+	binary.LittleEndian.PutUint16(hdr[20:], 1)            // PCM
+	binary.LittleEndian.PutUint16(hdr[22:], 1)            // mono
+	binary.LittleEndian.PutUint32(hdr[24:], uint32(rate)) // rate
+	binary.LittleEndian.PutUint32(hdr[28:], uint32(rate*2))
+	binary.LittleEndian.PutUint16(hdr[32:], 2)  // block align
+	binary.LittleEndian.PutUint16(hdr[34:], 16) // bits
 	copy(hdr[36:], "data")
 	binary.LittleEndian.PutUint32(hdr[40:], uint32(len(pcm)))
 	return append(hdr, pcm...)
 }
 
+// latinWake — доменная транслитерация латиницы в кириллицу для wake-word:
+// «archi» → «арчи», «archy» → «арчи». c→ч и h-пропуск специфичны для «Арчи»,
+// для остальных букв — фонетическая таблица.
+var latinWake = strings.NewReplacer(
+	"a", "а", "b", "б", "c", "ч", "d", "д", "e", "е", "f", "ф",
+	"g", "г", "h", "", "i", "и", "j", "й", "k", "к", "l", "л",
+	"m", "м", "n", "н", "o", "о", "p", "р", "q", "к", "r", "р",
+	"s", "с", "t", "т", "u", "у", "v", "в", "w", "в", "x", "кс",
+	"y", "и", "z", "з",
+)
+
 // splitWakeWord проверяет, начинается ли фраза с wake-word.
-// Возвращает (остаток-команду, true) при матче; («», false) — мимо.
+// Терпим к раскладке (archi), опечаткам (арче — Левенштейн ≤1) и
+// склейкам/разрывам пробелами («ар чи»). Возвращает (команду, true) при матче.
+// ВНИМАНИЕ: транслитерация применяется ТОЛЬЬКО к кандидату-слову —
+// остальной текст команды не искажается («status» остаётся «status»).)
 func splitWakeWord(transcript string, words []string) (string, bool) {
 	norm := func(s string) string {
 		s = strings.ToLower(strings.TrimSpace(s))
 		s = strings.NewReplacer("ё", "е", "-", " ", ",", " ", ".", " ",
-			"!", " ", "?", " ", ":", " ").Replace(s)
+			"!", " ", "?", " ", ":", " ", ";", " ").Replace(s)
 		return strings.Join(strings.Fields(s), " ")
 	}
-	tok := strings.SplitN(norm(transcript), " ", 2)
+	tok := strings.SplitN(norm(transcript), " ", 3)
 	if len(tok) == 0 || tok[0] == "" {
 		return "", false
 	}
-	first := tok[0]
-	rest := ""
-	if len(tok) == 2 {
-		rest = strings.TrimSpace(tok[1])
+	first, joined := tok[0], tok[0]
+	if len(tok) >= 2 {
+		joined += tok[1]
+	}
+	// Транслит — только над кандидатами, не над командой.
+	firstT := latinWake.Replace(first)
+	joinedT := latinWake.Replace(joined)
+	restAfter := func(n int) string {
+		if len(tok) > n {
+			return strings.TrimSpace(strings.Join(tok[n:], " "))
+		}
+		return ""
 	}
 	for _, w := range words {
 		wn := norm(w)
 		if wn == "" {
 			continue
 		}
-		if first == wn || (len(first) >= 4 && editDistance(first, wn) <= 1) {
-			return rest, true
+		switch {
+		case first == wn || firstT == wn || first == latinWake.Replace(wn):
+			return restAfter(1), true
+		case joined == wn || joinedT == wn:
+			return restAfter(2), true
+		case len(first) >= len(wn)-1 &&
+			(editDistance(first, wn) <= 1 || editDistance(firstT, wn) <= 1):
+			return restAfter(1), true
+		case len(joinedT) >= len(wn) && editDistance(joinedT, wn) <= 1:
+			return restAfter(2), true
 		}
 	}
 	return "", false
+}
+
+// stripFirstToken срезает первое слово фразы (для движков dtw/http:
+// wake-word пойман акустически, но в транскрипте не распознан —
+// срезаем «арче»/«арчи и» и отправляем остаток как команду).
+func stripFirstToken(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, ' '); i > 0 {
+		return strings.TrimSpace(s[i+1:])
+	}
+	return ""
 }
 
 // editDistance — Левенштейн (короткие слова, O(n*m) не жалко).
@@ -299,11 +343,55 @@ func min3(a, b, c int) int {
 
 // ---- стриминговый рекордер (raw PCM на stdout) ----
 
+// streamRecorder — живой процесс-источник PCM (своя процессная группа).
+type streamRecorder struct {
+	cmd     *exec.Cmd
+	stdout  io.ReadCloser
+	stderr  *bytes.Buffer
+	backend string
+	device  string
+}
+
+// stop гасит весь граф рекордера и дожидается завершения.
+func (r *streamRecorder) stop() {
+	if r.cmd != nil && r.cmd.Process != nil {
+		_ = syscall.Kill(-r.cmd.Process.Pid, syscall.SIGTERM)
+		done := make(chan struct{})
+		go func() {
+			_, _ = r.cmd.Process.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			_ = syscall.Kill(-r.cmd.Process.Pid, syscall.SIGKILL)
+			<-done
+		}
+	}
+}
+
+// clipE укорачивает строку для лога.
+func clipE(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+// errText — человеческое объяснение смерти рекордера (с stderr и подсказками).
+func (r *streamRecorder) errText(err error) error {
+	msg := fmt.Errorf("поток %s (device=%s) оборвался: %w", r.backend, r.device, err)
+	if se := strings.TrimSpace(r.stderr.String()); se != "" {
+		msg = fmt.Errorf("%w | stderr: %s", msg, clipE(se, 300))
+	}
+	return msg
+}
+
 // startStreamRecorder поднимает рекордер, пишущий s16le/mono/rate на stdout.
-func startStreamRecorder(cfg config.VoiceMicConfig, rate int) (*exec.Cmd, io.ReadCloser, error) {
+func startStreamRecorder(cfg config.VoiceMicConfig, rate int) (*streamRecorder, error) {
 	backend, err := resolveBackend(cfg.Backend)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	device := cfg.Device
 	if device == "" {
@@ -315,16 +403,22 @@ func startStreamRecorder(cfg config.VoiceMicConfig, rate int) (*exec.Cmd, io.Rea
 		cmd = exec.Command("arecord", "-q", "-f", "S16_LE",
 			"-r", fmt.Sprintf("%d", rate), "-c", "1", "-D", device, "-t", "raw", "-")
 	case "parecord":
-		cmd = exec.Command("parecord", "--raw",
+		args := []string{"--raw",
 			"--rate", fmt.Sprintf("%d", rate), "--channels", "1",
-			"--format=s16le", "-")
+			"--format=s16le"}
+		// ФИКС: раньше --device терялся и parecord брал дефолтный источник.
+		if device != "" && device != "default" {
+			args = append(args, "--device="+device)
+		}
+		args = append(args, "-")
+		cmd = exec.Command("parecord", args...)
 	case "ffmpeg":
 		cmd = exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
 			"-f", "alsa", "-i", device,
 			"-ar", fmt.Sprintf("%d", rate), "-ac", "1",
 			"-f", "s16le", "pipe:1")
 	default:
-		return nil, nil, fmt.Errorf("ear: бэкенд %q не поддерживает стриминг", backend)
+		return nil, fmt.Errorf("ear: бэкенд %q не поддерживает стриминг", backend)
 	}
 	// Своя процессная группа — гасим весь граф рекордера одним сигналом.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -332,20 +426,20 @@ func startStreamRecorder(cfg config.VoiceMicConfig, rate int) (*exec.Cmd, io.Rea
 	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, nil, fmt.Errorf("ear: stdout рекордера: %w", err)
+		return nil, fmt.Errorf("ear: stdout рекордера: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, nil, fmt.Errorf("ear: старт %s: %w (stderr: %s)",
+		return nil, fmt.Errorf("ear: старт %s: %w (stderr: %s)",
 			backend, err, clipE(stderr.String(), 200))
 	}
-	return cmd, stdout, nil
+	return &streamRecorder{cmd: cmd, stdout: stdout, stderr: &stderr, backend: backend, device: device}, nil
 }
 
-func clipE(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
+// recorderHints — что проверить, если микрофонный поток умирает.
+func recorderHints() string {
+	return "проверь: 1) arecord -L (выбери plughw:... → ear.device) 2) для systemd-сервиса нужен " +
+		"Environment=XDG_RUNTIME_DIR=/run/user/1000 (PipeWire) либо юнит пользователя " +
+		"deploy/archi-ear-user.service 3) пользователь в группе audio 4) archi ear --test"
 }
 
 // askAgent отправляет команду демону через IPC-сокет (с отменой по ctx).
@@ -372,6 +466,74 @@ func askAgent(ctx context.Context, socket, text string) (string, error) {
 // RunEar — hands-free слушатель. Блокирует до отмены ctx.
 func RunEar(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	ear := cfg.Ear
+	engine := ear.WakeEngine
+
+	// Стартовая диагностика: сразу видно, чем слушаем и что может мешать.
+	if os.Getenv("XDG_RUNTIME_DIR") == "" && os.Getenv("PULSE_SERVER") == "" {
+		log.Warn("ear: XDG_RUNTIME_DIR пуст — дефолтный микрофон PipeWire недоступен " +
+			"из системного сервиса. Лекарства: юнит пользователя (deploy/archi-ear-user.service), " +
+			"или Environment=XDG_RUNTIME_DIR=/run/user/1000, или ear.device=plughw:... (arecord -L)")
+	}
+
+	// DTW-шаблоны (движки dtw/both).
+	var templates *WakeTemplates
+	if engine == "dtw" || engine == "both" {
+		t, err := LoadWakeTemplates(cfg.DataDir)
+		if err != nil {
+			if engine == "dtw" {
+				return fmt.Errorf("%w — сначала обучи уши: archi ear --train-wake", err)
+			}
+			log.Error("ear: dtw-шаблоны не загрузились, слушаю только по STT", "err", err)
+		} else {
+			if ear.WakeThreshold > 0 {
+				t.Threshold = ear.WakeThreshold // ручная подстройка из конфига
+			}
+			templates = t
+			log.Info("ear: dtw-шаблоны загружены", "samples", len(t.Samples),
+				"threshold", t.Threshold, "word", t.WakeWord)
+		}
+	}
+	if ear.WakeEngine == "http" {
+		log.Info("ear: wake-сайдкар", "url", ear.WakeServerURL,
+			"hint", "модель «Арчи»: openwakeword.com или livekit-wakeword, deploy/wake_server.py")
+	}
+
+	// STT нужен для текста команды (кроме чистого wake-режима); пробуем один раз
+	// при старте, чтобы глухой провайдер был виден в журнале сразу, а не «по факту».
+	var stt *Transcriber
+	if cfg.Voice.STT.Enabled {
+		stt = NewTranscriber(cfg.Voice.STT, log)
+	} else {
+		log.Error("ear: voice.stt выключен — команды голосом НЕ распознаются " +
+			"(wake-word можно ловить движком dtw/http)")
+	}
+
+	// Сессии рекордера: если поток умирает (USB-микрофон, смена источника
+	// PipeWire, suspend) — поднимаем заново, не отдавая процесс на рестарт
+	// systemd (Restart=always имеет StartLimitBurst и может сдаться навсегда).
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		err := runEarSession(ctx, cfg, engine, templates, stt, log)
+		if ctx.Err() != nil {
+			return nil
+		}
+		log.Error("ear: сессия рекордера прервана, перезапуск через 3 с", "err", err,
+			"hints", recorderHints())
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(3 * time.Second):
+		}
+	}
+}
+
+// runEarSession — один цикл жизни рекордера: слушать → ловить wake → отвечать.
+func runEarSession(ctx context.Context, cfg config.Config, engine string,
+	templates *WakeTemplates, stt *Transcriber, log *slog.Logger) error {
+
+	ear := cfg.Ear
 	rate := cfg.Voice.Mic.SampleRate
 	if rate == 0 {
 		rate = 16000
@@ -382,20 +544,15 @@ func RunEar(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	}
 	frameBytes := rate / 1000 * frameMs * 2
 
-	cmd, stdout, err := startStreamRecorder(cfg.Voice.Mic, rate)
+	rec, err := startStreamRecorder(cfg.Voice.Mic, rate)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-		}
-		_, _ = cmd.Process.Wait()
-	}()
-	log.Info("ear: слушаю микрофон", "wake_words", ear.WakeWords,
+	defer rec.stop()
+	log.Info("ear: слушаю микрофон", "backend", rec.backend, "device", rec.device,
+		"engine", engine, "wake_words", ear.WakeWords,
 		"rate", rate, "frame_ms", frameMs, "vad", "rms")
 
-	stt := NewTranscriber(cfg.Voice.STT, log)
 	var tts *Synthesizer
 	if cfg.Voice.TTS.Enabled {
 		tts = NewSynthesizer(cfg.Voice.TTS, log)
@@ -406,15 +563,19 @@ func RunEar(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	bargeIn := ear.BargeIn == nil || *ear.BargeIn
 
 	frames := make(chan []byte, 128)
+	streamErr := make(chan error, 1)
 	// Читатель потока: если слушатель занят (STT/LLM), канал переполняется
 	// и кадры теряются — рекордер не блокируется, это осознанно.
 	go func() {
 		defer close(frames)
 		buf := make([]byte, frameBytes)
 		for {
-			if _, err := io.ReadFull(stdout, buf); err != nil {
+			if _, err := io.ReadFull(rec.stdout, buf); err != nil {
 				if ctx.Err() == nil {
-					log.Error("ear: поток микрофона оборвался", "err", err)
+					select {
+					case streamErr <- rec.errText(err):
+					default:
+					}
 				}
 				return
 			}
@@ -475,13 +636,16 @@ func RunEar(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 			return nil
 		case frame, ok := <-frames:
 			if !ok {
-				return fmt.Errorf("ear: рекордер остановился")
+				select {
+				case err := <-streamErr:
+					return err
+				default:
+					return fmt.Errorf("ear: рекордер остановился без объяснений")
+				}
 			}
 
 			// Полудуплекс: во время озвучки VAD не кормим (эхо!), но ловим
 			// устойчивую громкую речь — это перебивание владельца.
-			// Порог выше обычного старта (×1.8) и дольше (8 кадров ≈ 240 мс),
-			// чтобы собственный динамик не перебивал сам себя.
 			playMu.Lock()
 			playing := playCancel != nil
 			playMu.Unlock()
@@ -510,30 +674,87 @@ func RunEar(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 				continue // эхо/cooldown — кадры мимо VAD
 			}
 
+			wasLearning := v.Learning()
 			v.SetLastFrame(frame)
-			if v.feed(rms(frame)) != vadUtterance {
+			event := v.feed(rms(frame))
+			if wasLearning && !v.Learning() {
+				log.Info("ear: шумовой пол откалиброван",
+					"floor_rms", math.Round(v.floor),
+					"речь_начинается_с_rms", math.Round(v.floor*ear.VAD.StartFactor),
+					"note", "если говоришь громче, а фразы не появляются — подними микрофон/громкость")
+			}
+			if event != vadUtterance {
 				continue
 			}
 			pcm := v.takeUtterance()
 
-			transcript, err := stt.Transcribe(ctx, wrapWAV(pcm, rate), "ear.wav")
-			if err != nil {
-				log.Warn("ear: распознавание не удалось", "err", err)
-				continue
+			// Транскрипт нужен почти всегда: движок stt — для wake, остальные —
+			// для текста команды. Сбой STT не роняет локальные движки.
+			transcript := ""
+			if stt != nil {
+				tr, err := stt.Transcribe(ctx, wrapWAV(pcm, rate), "ear.wav")
+				if err != nil {
+					log.Warn("ear: распознавание не удалось (команда может потеряться)", "err", err)
+				} else {
+					transcript = strings.TrimSpace(tr)
+				}
 			}
-			transcript = strings.TrimSpace(transcript)
-			if transcript == "" {
-				continue
+			if transcript != "" {
+				log.Debug("ear: услышал фразу", "transcript", clipE(transcript, 160))
 			}
-			command, isWake := splitWakeWord(transcript, ear.WakeWords)
+
+			// ---- детекция wake-word движком ----
+			// Семантика строгая: stt — совпадение слова в транскрипте; dtw —
+			// акустика (транскрипт идёт только в текст команды); http — модель
+			// в сайдкаре; both — любой из stt/dtw. Местный wake не зависит от облака.
+			wake := false
+			command := ""
+			if engine == "stt" || engine == "both" {
+				if rest, m := splitWakeWord(transcript, ear.WakeWords); m {
+					wake, command = true, rest
+				}
+			}
+			if !wake && templates != nil && (engine == "dtw" || engine == "both") {
+				if d, m := templates.MatchWake(pcm, rate); m {
+					wake = true
+					log.Info("ear: wake-word по шаблону (dtw)", "dist", math.Round(d*100)/100,
+						"threshold", templates.Threshold)
+					if command == "" && transcript != "" {
+						command = stripFirstToken(transcript)
+					}
+				}
+			}
+			if !wake && engine == "http" {
+				r, err := httpWakeDetect(ctx, ear.WakeServerURL, wrapWAV(pcm, rate))
+				if err != nil {
+					log.Warn("ear: wake-сайдкар не ответил, пробую по транскрипту", "err", err)
+					if rest, m := splitWakeWord(transcript, ear.WakeWords); m {
+						wake, command = true, rest
+					}
+				} else if r.Detected {
+					wake = true
+					log.Info("ear: wake-word по модели (http)", "keyword", r.Keyword,
+						"score", math.Round(r.Score*100)/100)
+					if command == "" && transcript != "" {
+						command = stripFirstToken(transcript)
+					}
+				}
+			}
+
 			switch {
-			case isWake && command != "":
+			case wake && command != "":
 				log.Info("ear: команда", "text", command)
-			case isWake:
+			case wake:
 				log.Info("ear: wake-word услышан, жду команду")
 				armed = true
 				continue
 			case armed:
+				if transcript == "" {
+					log.Error("ear: фраза после активации не распознана — STT недоступен?",
+						"hints", "проверь voice.stt (base_url/ключ), archi ear --test")
+					speak("Не смог распознать команду")
+					continue
+				}
 				command = transcript
 				log.Info("ear: команда (после активации)", "text", command)
 			default:

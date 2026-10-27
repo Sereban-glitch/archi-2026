@@ -207,12 +207,15 @@ type ObservabilityConfig struct {
 // EarConfig — hands-free голос («арчи, …»): VAD → wake-word → команда → ответ голосом.
 // Запускается отдельным процессом `archi ear` (deploy/archi-ear.service).
 type EarConfig struct {
-	Enabled      bool         `yaml:"enabled"` // валидация связок; слушатель живёт отдельно
-	WakeWords    []string     `yaml:"wake_words"`
-	MaxUtterance Duration     `yaml:"max_utterance"`
-	Cooldown     Duration     `yaml:"cooldown"` // пауза после ответа (анти-эхо)
-	BargeIn      *bool        `yaml:"barge_in"` // перебивать ли озвучку речью; nil = true
-	VAD          EarVADConfig `yaml:"vad"`
+	Enabled       bool         `yaml:"enabled"` // валидация связок; слушатель живёт отдельно
+	WakeWords     []string     `yaml:"wake_words"`
+	WakeEngine    string       `yaml:"wake_engine"`     // stt | dtw | http | both (как ловим wake-word)
+	WakeServerURL string       `yaml:"wake_server_url"` // сайдкар wake-детектора (openWakeWord ONNX)
+	WakeThreshold float64      `yaml:"wake_threshold"`  // порог DTW-движка (после --train-wake подскажет)
+	MaxUtterance  Duration     `yaml:"max_utterance"`
+	Cooldown      Duration     `yaml:"cooldown"` // пауза после ответа (анти-эхо)
+	BargeIn       *bool        `yaml:"barge_in"` // перебивать ли озвучку речью; nil = true
+	VAD           EarVADConfig `yaml:"vad"`
 }
 
 // EarVADConfig — энергия-RMS VAD (чистый Go, без моделей): адаптивный шумовой пол,
@@ -557,6 +560,14 @@ func (c *Config) applyDefaults() {
 	if len(c.Ear.WakeWords) == 0 {
 		c.Ear.WakeWords = []string{"арчи", "archi"}
 	}
+	switch strings.ToLower(strings.TrimSpace(c.Ear.WakeEngine)) {
+	case "":
+		c.Ear.WakeEngine = "stt"
+	default:
+		c.Ear.WakeEngine = strings.ToLower(strings.TrimSpace(c.Ear.WakeEngine))
+	}
+	// Ear.WakeThreshold: 0 (по умолчанию) = порог из файла wake-templates.json,
+	// явное значение перекрывает порог из файла (ручная подстройка чувствительности).
 	if c.Ear.MaxUtterance.Duration == 0 {
 		c.Ear.MaxUtterance.Duration = 20 * time.Second
 	}
@@ -775,6 +786,15 @@ func (c *Config) Validate() []string {
 		}
 		if c.Ear.MaxUtterance.Duration < 2*time.Second {
 			errs = append(errs, "ear.max_utterance < 2s — слишком коротко для команды")
+		}
+		switch c.Ear.WakeEngine {
+		case "stt", "dtw", "both":
+		case "http":
+			if c.Ear.WakeServerURL == "" {
+				errs = append(errs, "ear.wake_engine=http требует ear.wake_server_url (сайдкар wake-детектора, см. deploy/wake_server.py)")
+			}
+		default:
+			errs = append(errs, fmt.Sprintf("ear.wake_engine=%q не поддерживается (stt|dtw|http|both)", c.Ear.WakeEngine))
 		}
 	}
 	if c.Ear.VAD.StartFactor > 0 && c.Ear.VAD.StopFactor > 0 && c.Ear.VAD.StartFactor <= c.Ear.VAD.StopFactor {

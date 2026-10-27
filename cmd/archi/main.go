@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -34,7 +35,7 @@ import (
 	"github.com/archi/archi/internal/voice"
 )
 
-var version = "2026.13.0"
+var version = "2026.14.0"
 
 func main() {
 	if len(os.Args) > 1 {
@@ -74,7 +75,7 @@ func main() {
 			return
 		}
 	}
-	fmt.Fprintf(os.Stderr, "Archi %s — гибридный DevOps-агент\n\nИспользование:\n  archi serve [--config config.yaml]\n  archi ctl \"текст\" [--config config.yaml]\n  archi voice [--speak] [--config config.yaml]\n  archi ear [--config config.yaml]      — hands-free слушатель (wake-word)\n  archi check-config [--config config.yaml]\n  archi version\n", version)
+	fmt.Fprintf(os.Stderr, "Archi %s — гибридный DevOps-агент\n\nИспользование:\n  archi serve [--config config.yaml]\n  archi ctl \"текст\" [--config config.yaml]\n  archi voice [--speak] [--config config.yaml]\n  archi ear [--test|--train-wake] [--samples N] [--config config.yaml]\n      — hands-free слушатель (wake-word); --test — диагностика слуха\n  archi check-config [--config config.yaml]\n  archi version\n", version)
 	os.Exit(2)
 }
 
@@ -396,16 +397,45 @@ func runVoice(args []string) error {
 // runEarDaemon — archi ear: hands-free слушатель «Арчи, …» (отдельный процесс,
 // deploy/archi-ear.service). Слушает микрофон, ловит wake-word, шлёт команды
 // демону через IPC и озвучивает ответы (если включён TTS).
+//
+// --test       — диагностика слуха (захват → VAD → STT → wake → IPC) без демона.
+// --train-wake — записать шаблоны wake-word голосом владельца (для wake_engine: dtw).
 func runEarDaemon(args []string) error {
-	cfgPath, err := flagsConfig(args)
-	if err != nil {
-		return err
+	cfgPath := "/etc/archi/config.yaml"
+	var test, train bool
+	samples := 5
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--config" || a == "-config":
+			if i+1 < len(args) {
+				cfgPath = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(a, "--config="):
+			cfgPath = strings.TrimPrefix(a, "--config=")
+		case a == "--test":
+			test = true
+		case a == "--train-wake":
+			train = true
+		case a == "--samples":
+			if i+1 < len(args) {
+				if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 && n <= 20 {
+					samples = n
+				}
+				i++
+			}
+		case strings.HasPrefix(a, "--samples="):
+			if n, err := strconv.Atoi(strings.TrimPrefix(a, "--samples=")); err == nil && n > 0 && n <= 20 {
+				samples = n
+			}
+		}
 	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
 	}
-	if !cfg.Ear.Enabled {
+	if !test && !train && !cfg.Ear.Enabled {
 		return errors.New("ear.enabled=false — включи hands-free режим в конфиге")
 	}
 	log := newLogger(cfg.LogLevel)
@@ -413,7 +443,15 @@ func runEarDaemon(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if test {
+		return voice.RunEarTest(ctx, *cfg, log)
+	}
+	if train {
+		return voice.RunEarTrain(ctx, *cfg, log, samples)
+	}
+
 	log.Info("archi-ear запускается", "version", version,
-		"ipc", cfg.IPC.SocketPath, "wake_words", cfg.Ear.WakeWords)
+		"ipc", cfg.IPC.SocketPath, "wake_words", cfg.Ear.WakeWords,
+		"engine", cfg.Ear.WakeEngine)
 	return voice.RunEar(ctx, *cfg, log)
 }
