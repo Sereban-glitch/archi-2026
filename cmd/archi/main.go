@@ -25,13 +25,14 @@ import (
 	"github.com/archi/archi/internal/agent"
 	"github.com/archi/archi/internal/bridge"
 	"github.com/archi/archi/internal/config"
+	"github.com/archi/archi/internal/cron"
 	"github.com/archi/archi/internal/ipc"
 	"github.com/archi/archi/internal/telegram"
 	"github.com/archi/archi/internal/tools"
 	"github.com/archi/archi/internal/voice"
 )
 
-var version = "2026.11.0"
+var version = "2026.12.0"
 
 func main() {
 	if len(os.Args) > 1 {
@@ -168,7 +169,8 @@ func runServe(args []string) error {
 		defer srv.Close()
 	}
 
-	// 5) Telegram: polling + голосовые + тревоги + сводки.
+	// 5) Telegram: polling + голосовые + тревоги + сводки + approval-клавиатуры.
+	var runner *telegram.Runner
 	if cfg.Telegram.Enabled {
 		bot := telegram.New(cfg.Telegram, log)
 		var stt *voice.Transcriber
@@ -176,6 +178,10 @@ func runServe(args []string) error {
 		if cfg.Voice.STT.Enabled {
 			stt = voice.NewTranscriber(cfg.Voice.STT, log)
 			log.Info("voice: STT включён", "model", cfg.Voice.STT.Model, "base_url", cfg.Voice.STT.BaseURL)
+			if cfg.Voice.STT.Fallback != nil {
+				log.Info("voice: STT фолбэк подключён", "model", cfg.Voice.STT.Fallback.Model,
+					"base_url", cfg.Voice.STT.Fallback.BaseURL)
+			}
 		}
 		if cfg.Voice.TTS.Enabled {
 			tts = voice.NewSynthesizer(cfg.Voice.TTS, log)
@@ -185,7 +191,7 @@ func runServe(args []string) error {
 		if len(digestChats) == 0 {
 			digestChats = cfg.Telegram.Admins
 		}
-		runner := telegram.NewRunner(bot, ag, br, tz, telegram.DigestSchedule{
+		runner = telegram.NewRunner(bot, ag, br, tz, telegram.DigestSchedule{
 			Enabled: cfg.Telegram.Digest.Enabled,
 			Times:   cfg.Telegram.Digest.Times,
 			Chats:   digestChats,
@@ -194,6 +200,26 @@ func runServe(args []string) error {
 		log.Info("telegram: включён", "admins", len(cfg.Telegram.Admins))
 	} else {
 		log.Info("telegram: отключён в конфиге")
+	}
+
+	// Approval: опасные команды идут через Telegram-клавиатуру владельца.
+	// Telegram выключен → подтвержать некому — политика падает в отказ (fail-closed).
+	if runner != nil {
+		registry.SetApprover(runner)
+		log.Info("tools: approval-клавиатуры подключены")
+	} else {
+		log.Warn("tools: Telegram выключен — опасные команды будут ОТКЛОНЯТЬСЯ (fail-closed)")
+	}
+
+	// 6) Cron: проактивные задания агента (расписание + промпт → ReAct).
+	if cfg.Cron.Enabled {
+		var ntf cron.Notifier
+		if runner != nil {
+			ntf = runner
+		}
+		eng := cron.New(cfg.Cron, ag, ntf, mem, tz, log)
+		go eng.Run(ctx)
+		log.Info("cron: движок проактивности запущен", "jobs", len(cfg.Cron.Jobs))
 	}
 
 	log.Info("archi запущен", "version", version, "node", cfg.NodeName, "remote", cfg.Bridge.Remote.Host, "pid", os.Getpid())

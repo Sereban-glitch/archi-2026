@@ -13,9 +13,9 @@ import (
 // Вдохновлено практикой продовых watchdog-ов 2026: тревога без cooldown — это спам,
 // а спам приучает игнорировать действительно критичные события.
 type Alerter struct {
-	cfg      config.AlertsConfig
-	log      *slog.Logger
-	mu       sync.Mutex
+	cfg       config.AlertsConfig
+	log       *slog.Logger
+	mu        sync.Mutex
 	lastFired map[string]time.Time // "node|kind" → время последней тревоги
 }
 

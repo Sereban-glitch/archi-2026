@@ -65,6 +65,7 @@ type Response struct {
 type apiError struct {
 	Type    string `json:"type"`
 	Message string `json:"message"`
+	Status  int    // HTTP-статус ответа (429/5xx — ретраебельны)
 }
 
 type apiErrorEnvelope struct {
@@ -84,14 +85,14 @@ type Request struct {
 // Отказоустойчивость: экспоненциальный backoff + джиттер на 429/5xx/сетевых
 // ошибках (включая ECONNRESET — бич node-телеграм-ботов и прокси), honor Retry-After.
 type Client struct {
-	base       string
-	key        string
-	model      string
-	maxTokens  int
-	maxRetries int
+	base                    string
+	key                     string
+	model                   string
+	maxTokens               int
+	maxRetries              int
 	backoffBase, backoffMax time.Duration
-	http       *http.Client
-	log        *slog.Logger
+	http                    *http.Client
+	log                     *slog.Logger
 }
 
 // NewClient создаёт LLM-клиент.
@@ -196,6 +197,7 @@ func (c *Client) post(ctx context.Context, body []byte) (*Response, *apiError, t
 				ae.Message = ae.Message[:400]
 			}
 		}
+		ae.Status = resp.StatusCode
 		var retryAfter time.Duration
 		if resp.StatusCode == 429 {
 			if v := resp.Header.Get("Retry-After"); v != "" {
@@ -228,14 +230,16 @@ func (c *Client) backoff(attempt int) time.Duration {
 }
 
 // retryable — можно ли повторять запрос.
+// 429 (rate limit) и 5xx (перегрузка прокси/апстрима) — да; остальные 4xx — нет.
 func retryable(ae *apiError, err error) bool {
 	if ae != nil {
-		return false // 4xx/5xx тела API: повтор не поможет (кроме 429/5xx — но прокси возвращает их как сеть)
+		return ae.Status == 429 || ae.Status >= 500
 	}
 	return true // сетевые ошибки всегда ретраебельны
 }
 
 // isRetryableNet классифицирует сетевую ошибку как ретраебельную.
+// Дедлайн самого запроса НЕ ретраим: caller контролирует общий бюджет через ctx.
 func isRetryableNet(err error) bool {
 	if err == nil {
 		return false
@@ -244,8 +248,7 @@ func isRetryableNet(err error) bool {
 		errors.Is(err, syscall.ECONNREFUSED) ||
 		errors.Is(err, syscall.EPIPE) ||
 		errors.Is(err, io.EOF) ||
-		errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, context.DeadlineExceeded) && false { // защищаемся от случайного true
+		errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
 	var netErr net.Error

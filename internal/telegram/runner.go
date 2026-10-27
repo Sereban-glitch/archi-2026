@@ -14,7 +14,8 @@ import (
 	"github.com/archi/archi/internal/voice"
 )
 
-// Runner — связка бота с агентом: маршрутизация команд, голосовые, тревоги, сводки.
+// Runner — связка бота с агентом: маршрутизация команд, голосовые, тревоги, сводки,
+// approval-клавиатуры для опасных команд.
 type Runner struct {
 	bot    *Bot
 	agent  *agent.Agent
@@ -25,7 +26,12 @@ type Runner struct {
 	tz     *time.Location
 
 	digestCfg DigestSchedule
-	once      sync.Once
+	admins    []int64
+
+	// approval: ожидающие решения (callback data «appr:<id>» → канал решения)
+	apprMu   sync.Mutex
+	apprWait map[string]chan bool
+	apprSeq  int64
 }
 
 // DigestSchedule — параметры сводок.
@@ -39,7 +45,70 @@ type DigestSchedule struct {
 func NewRunner(bot *Bot, a *agent.Agent, b *bridge.Bridge, tz *time.Location,
 	digest DigestSchedule, stt *voice.Transcriber, tts *voice.Synthesizer, log *slog.Logger) *Runner {
 	return &Runner{
-		bot: bot, agent: a, bridge: b, stt: stt, tts: tts, log: log, tz: tz, digestCfg: digest,
+		bot: bot, agent: a, bridge: b, stt: stt, tts: tts, log: log, tz: tz,
+		digestCfg: digest, apprWait: make(map[string]chan bool),
+	}
+}
+
+// Ask — реализация tools.Approver: inline-клавиатура первому админу,
+// ждём решения до отмены ctx (таймаут задаёт вызывающий — tools.confirm).
+// Нет ответа/ошибки → false (fail-closed).
+func (r *Runner) Ask(ctx context.Context, summary string) (bool, error) {
+	if len(r.digestCfg.Chats) == 0 {
+		return false, fmt.Errorf("не указаны админы для approval-клавиатуры (telegram.admins)")
+	}
+	chatID := r.digestCfg.Chats[0] // решение принимает первый админ
+
+	r.apprMu.Lock()
+	r.apprSeq++
+	id := strconv.FormatInt(r.apprSeq, 36)
+	ch := make(chan bool, 1)
+	r.apprWait[id] = ch
+	r.apprMu.Unlock()
+	defer func() {
+		r.apprMu.Lock()
+		delete(r.apprWait, id)
+		r.apprMu.Unlock()
+	}()
+
+	msgID, err := r.bot.SendKeyboard(ctx, chatID, summary, [][2]string{
+		{"appr:" + id + ":yes", "✅ Разрешить"},
+		{"appr:" + id + ":no", "❌ Отклонить"},
+	})
+	if err != nil {
+		return false, fmt.Errorf("клавиатура не отправлена: %w", err)
+	}
+
+	select {
+	case ok := <-ch:
+		_ = r.bot.EditMessageText(ctx, chatID, msgID, summary+"\n\n"+map[bool]string{true: "✅ ОДОБРЕНО — исполняю…", false: "❌ ОТКЛОНЕНО"}[ok])
+		return ok, nil
+	case <-ctx.Done():
+		_ = r.bot.EditMessageText(context.Background(), chatID, msgID, summary+"\n\n⏱ Время на решение истекло — команда НЕ исполнена (fail-closed).")
+		return false, fmt.Errorf("владелец не ответил за отведённое время")
+	}
+}
+
+// handleCallback — разбор нажатий inline-кнопок approval-клавиатур.
+func (r *Runner) handleCallback(chatID, userID int64, data, callbackID string) {
+	r.bot.AnswerCallback(context.Background(), callbackID, "")
+	if !strings.HasPrefix(data, "appr:") {
+		return
+	}
+	parts := strings.Split(data, ":")
+	if len(parts) != 3 {
+		return
+	}
+	id, verdict := parts[1], parts[2] == "yes"
+	r.apprMu.Lock()
+	ch, ok := r.apprWait[id]
+	r.apprMu.Unlock()
+	if !ok {
+		return // уже отвечено/истекло — игнор
+	}
+	select {
+	case ch <- verdict:
+	default: // решение уже принято — не блокируемся
 	}
 }
 
@@ -48,9 +117,12 @@ func (r *Runner) Run(ctx context.Context) {
 	go r.watchEvents(ctx)
 	go r.digestLoop(ctx)
 
-	err := r.bot.Run(ctx, func(chatID, userID int64, text string, att *VoiceAttachment) {
-		r.handleMessage(ctx, chatID, userID, text, att)
-	})
+	err := r.bot.Run(ctx,
+		func(chatID, userID int64, text string, att *VoiceAttachment) {
+			r.handleMessage(ctx, chatID, userID, text, att)
+		},
+		r.handleCallback, // approval-кнопки
+	)
 	if err != nil && ctx.Err() == nil {
 		r.log.Error("tg: polling остановлен с ошибкой", "err", err)
 	}
@@ -144,16 +216,17 @@ func (r *Runner) replyWithAgent(ctx context.Context, chatID int64, text, echo st
 	_ = r.bot.SendMessage(ctx, chatID, reply)
 
 	// Голосовой ответ (TTS): только если включён и ответ достаточно короткий.
+	// ctx (не actx!): actx мог быть почти исчерпан ReAct-циклом (аудит 2026-10).
 	if r.tts != nil && err == nil && reply != "" {
 		if max := r.tts.MaxChars(); max > 0 && len([]rune(reply)) > max {
 			return // длинные простыни не озвучиваем — читаем глазами
 		}
-		audio, err := r.tts.Synthesize(actx, voice.PlainText(reply))
+		audio, err := r.tts.Synthesize(ctx, voice.PlainText(reply))
 		if err != nil {
 			r.log.Warn("tg: TTS не озвучил ответ", "err", err)
 			return
 		}
-		if err := r.bot.SendVoice(actx, chatID, audio, 0); err != nil {
+		if err := r.bot.SendVoice(ctx, chatID, audio, 0); err != nil {
 			r.log.Warn("tg: sendVoice не прошёл", "err", err)
 		}
 	}
@@ -182,7 +255,18 @@ func (r *Runner) statusText() string {
 			pair.title, pair.m.Hostname, pair.m.CPUPercent, pair.m.MemPercent(),
 			pair.m.DiskPercent(), pair.m.Load1, humanDur(pair.m.UptimeSec))
 	}
+	if r.agent != nil {
+		req, inT, outT := r.agent.UsageStats()
+		fmt.Fprintf(&sb, "🧠 LLM с старта: запросов %d, токенов in %d / out %d\n", req, inT, outT)
+	}
 	return sb.String()
+}
+
+// NotifyAdmins — рассылка текста всем админам (реализация cron.Notifier).
+func (r *Runner) NotifyAdmins(ctx context.Context, text string) {
+	for _, id := range r.digestCfg.Chats {
+		_ = r.bot.SendMessage(ctx, id, text)
+	}
 }
 
 // watchEvents — тревоги моста → админам.
@@ -202,6 +286,8 @@ func (r *Runner) watchEvents(ctx context.Context) {
 }
 
 // digestLoop — сводки в заданное время.
+// Фикс 2026-10: раньше слоты искались только сегодня, и вечером следующий
+// огонь смещался на ровно +24ч, пропуская завтрашнее утро (P1-аудита).
 func (r *Runner) digestLoop(ctx context.Context) {
 	if !r.digestCfg.Enabled || len(r.digestCfg.Times) == 0 {
 		return
@@ -209,14 +295,16 @@ func (r *Runner) digestLoop(ctx context.Context) {
 	for {
 		now := time.Now().In(r.tz)
 		next := now.Add(24 * time.Hour)
-		for _, t := range r.digestCfg.Times {
-			var h, m int
-			if _, err := fmt.Sscanf(t, "%d:%d", &h, &m); err != nil {
-				continue
-			}
-			cand := time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, r.tz)
-			if cand.After(now) && cand.Before(next) {
-				next = cand
+		for day := 0; day < 2; day++ { // сегодня и завтра — ближайший слот всегда найдётся
+			for _, t := range r.digestCfg.Times {
+				var h, m int
+				if _, err := fmt.Sscanf(t, "%d:%d", &h, &m); err != nil {
+					continue
+				}
+				cand := time.Date(now.Year(), now.Month(), now.Day()+day, h, m, 0, 0, r.tz)
+				if cand.After(now) && cand.Before(next) {
+					next = cand
+				}
 			}
 		}
 		select {

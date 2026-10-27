@@ -32,9 +32,9 @@ type NodeMetrics struct {
 
 	UptimeSec uint64 `json:"uptime_sec"`
 
-	Battery      *BatteryInfo            `json:"battery,omitempty"`
-	Temperatures map[string]float64      `json:"temperatures,omitempty"`
-	Services     []ServiceState          `json:"services,omitempty"`
+	Battery      *BatteryInfo       `json:"battery,omitempty"`
+	Temperatures map[string]float64 `json:"temperatures,omitempty"`
+	Services     []ServiceState     `json:"services,omitempty"`
 }
 
 // BatteryInfo — состояние батареи ноутбука (отсутствует на VM).
@@ -86,19 +86,19 @@ func (m *NodeMetrics) Service(name string) *ServiceState {
 type EventType string
 
 const (
-	EventAlert     EventType = "alert"       // сработал порог (RAM/CPU/disk/service)
-	EventNodeDown  EventType = "node_down"   // нода перестала отвечать
-	EventNodeUp    EventType = "node_up"     // нода вернулась в строй
-	EventRestarted EventType = "restarted"   // watchdog перезапустил сервис
+	EventAlert     EventType = "alert"     // сработал порог (RAM/CPU/disk/service)
+	EventNodeDown  EventType = "node_down" // нода перестала отвечать
+	EventNodeUp    EventType = "node_up"   // нода вернулась в строй
+	EventRestarted EventType = "restarted" // watchdog перезапустил сервис
 )
 
 // Event — событие, публикуемое мостом наружу (боту, IPC, логу).
 type Event struct {
-	Type      EventType  `json:"type"`
-	Node      string     `json:"node"`
-	Message   string     `json:"message"`
-	Severity  string     `json:"severity"` // warn / crit / info
-	Timestamp time.Time  `json:"ts"`
+	Type      EventType    `json:"type"`
+	Node      string       `json:"node"`
+	Message   string       `json:"message"`
+	Severity  string       `json:"severity"` // warn / crit / info
+	Timestamp time.Time    `json:"ts"`
 	Metrics   *NodeMetrics `json:"metrics,omitempty"`
 }
 
@@ -118,11 +118,11 @@ type Runner interface {
 
 // ExecResult — результат исполненной команды.
 type ExecResult struct {
-	Node     string        `json:"node"`
-	Command  string        `json:"command"`
-	Stdout   string        `json:"stdout"`
-	Stderr   string        `json:"stderr"`
-	ExitCode int           `json:"exit_code"`
-	Duration time.Duration `json:"duration_ms"`
-	Truncated bool         `json:"truncated"`
+	Node      string        `json:"node"`
+	Command   string        `json:"command"`
+	Stdout    string        `json:"stdout"`
+	Stderr    string        `json:"stderr"`
+	ExitCode  int           `json:"exit_code"`
+	Duration  time.Duration `json:"duration_ms"`
+	Truncated bool          `json:"truncated"`
 }

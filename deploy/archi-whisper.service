@@ -1,0 +1,54 @@
+# ============================================================
+# archi-whisper.service — локальный Whisper STT (фолбэк Archi)
+# HP ProBook 440 G3: i5-6200U 2C/4T, AVX2 — модель small q5_0
+# даёт RTF ~0.3-0.5 (8 сек речи ≈ 3-4 сек распознавания), RAM ~600 МБ.
+#
+# Установка:
+#   1) Собрать whisper.cpp (примеры/server):
+#        sudo apt install git build-essential cmake
+#        git clone https://github.com/ggml-org/whisper.cpp && cd whisper.cpp
+#        cmake -B build -DWHISPER_BUILD_SERVER=ON && cmake --build build -j --config Release
+#        sudo cp build/bin/whisper-server /usr/local/bin/
+#   2) Скачать модель (184 МБ):
+#        sudo mkdir -p /var/lib/archi/models
+#        sudo sh -c 'cd /var/lib/archi/models && curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_0.bin'
+#   3) Установить юнит:
+#        sudo cp archi-whisper.service /etc/systemd/system/
+#        sudo systemctl daemon-reload && sudo systemctl enable --now archi-whisper
+#
+# Проверка: curl http://127.0.0.1:9000/  → {"status":"ok"}
+# В config.yaml это фолбэк: voice.stt.fallback.base_url http://127.0.0.1:9000
+# ============================================================
+
+[Unit]
+Description=Archi local Whisper STT — offline fallback (whisper.cpp server)
+After=network.target
+
+[Service]
+Type=simple
+User=archi
+Group=archi
+
+ExecStart=/usr/local/bin/whisper-server \
+  --model /var/lib/archi/models/ggml-small-q5_0.bin \
+  --host 127.0.0.1 --port 9000 \
+  --convert
+
+Restart=on-failure
+RestartSec=10
+
+# Ноутбук щедрый, но голосовой фолбэк не должен душить прод:
+# низкий вес CPU + фоновый приоритет + потолок памяти.
+CPUWeight=25
+Nice=10
+MemoryMax=1500M
+
+# Безопасность: сервер ничего кроме модели читать не должен.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/archi/models
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -30,8 +30,17 @@ import (
 
 // Update — входящее обновление Telegram (только нужные поля).
 type Update struct {
-	UpdateID int64      `json:"update_id"`
-	Message  *TgMessage `json:"message,omitempty"`
+	UpdateID      int64       `json:"update_id"`
+	Message       *TgMessage  `json:"message,omitempty"`
+	CallbackQuery *TgCallback `json:"callback_query,omitempty"` // кнопки approval-клавиатур
+}
+
+// TgCallback — нажатие inline-кнопки.
+type TgCallback struct {
+	ID      string     `json:"id"`
+	From    *TgUser    `json:"from,omitempty"`
+	Data    string     `json:"data,omitempty"`    // payload кнопки (appr:<id>:ok/no)
+	Message *TgMessage `json:"message,omitempty"` // сообщение с клавиатурой
 }
 
 // TgMessage — сообщение.
@@ -427,9 +436,65 @@ func (b *Bot) SendChatAction(ctx context.Context, chatID int64, action string) {
 	}
 }
 
-// Run — цикл long polling. updatesFn вызывается на каждое сообщение
-// (текстовое — с text, голосовое/аудио — с att).
-func (b *Bot) Run(ctx context.Context, updatesFn func(chatID, userID int64, text string, att *VoiceAttachment)) error {
+// SendKeyboard — сообщение с inline-клавиатурой: buttons — (data, label) пары.
+// Возвращает message_id (нужно для последующего editMessageText).
+func (b *Bot) SendKeyboard(ctx context.Context, chatID int64, text string, buttons [][2]string) (int64, error) {
+	rows := make([]map[string]any, 0, len(buttons))
+	for _, btn := range buttons {
+		rows = append(rows, map[string]any{
+			"text":          btn[1],
+			"callback_data": btn[0],
+		})
+	}
+	payload := map[string]any{
+		"chat_id":      chatID,
+		"text":         text,
+		"reply_markup": map[string]any{"inline_keyboard": [][]map[string]any{rows}},
+	}
+	raw, err := b.pollResponse(ctx, "sendMessage", payload, 3)
+	if err != nil {
+		return 0, err
+	}
+	var m struct {
+		MessageID int64 `json:"message_id"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return 0, fmt.Errorf("sendKeyboard parse: %w", err)
+	}
+	return m.MessageID, nil
+}
+
+// EditMessageText — правит текст сообщения (убирает «висящую» клавиатуру решением).
+func (b *Bot) EditMessageText(ctx context.Context, chatID, messageID int64, text string) error {
+	payload := map[string]any{
+		"chat_id":      chatID,
+		"message_id":   messageID,
+		"text":         text,
+		"reply_markup": map[string]any{"inline_keyboard": [][]map[string]any{}},
+	}
+	_, _, _, err := b.doPost(ctx, "editMessageText", mustJSON(payload))
+	if err != nil {
+		b.log.Debug("tg: editMessageText не прошёл", "err", err)
+	}
+	return err
+}
+
+// AnswerCallback — подтверждение нажатия кнопки (снимает «часики» в клиенте).
+func (b *Bot) AnswerCallback(ctx context.Context, callbackID, text string) {
+	payload := map[string]any{"callback_query_id": callbackID}
+	if text != "" {
+		payload["text"] = text
+	}
+	if _, _, _, err := b.doPost(ctx, "answerCallbackQuery", mustJSON(payload)); err != nil {
+		b.log.Debug("tg: answerCallbackQuery не прошёл", "err", err)
+	}
+}
+
+// Run — цикл long polling. msgFn вызывается на каждое сообщение
+// (текстовое — с text, голосовое/аудио — с att); cbFn — на нажатие inline-кнопки.
+func (b *Bot) Run(ctx context.Context,
+	msgFn func(chatID, userID int64, text string, att *VoiceAttachment),
+	cbFn func(chatID, userID int64, data, callbackID string)) error {
 	b.mu.Lock()
 	if b.running {
 		b.mu.Unlock()
@@ -452,7 +517,7 @@ func (b *Bot) Run(ctx context.Context, updatesFn func(chatID, userID int64, text
 		payload := map[string]any{
 			"offset":          offset,
 			"timeout":         int(b.pollTimeout.Seconds()),
-			"allowed_updates": []string{"message"},
+			"allowed_updates": []string{"message", "callback_query"},
 		}
 		raw, err := b.pollResponse(ctx, "getUpdates", payload, 6)
 		if err != nil {
@@ -476,6 +541,24 @@ func (b *Bot) Run(ctx context.Context, updatesFn func(chatID, userID int64, text
 			if u.UpdateID > b.lastUpdate {
 				b.lastUpdate = u.UpdateID
 			}
+			// inline-кнопка (approval-клавиатуры)
+			if cb := u.CallbackQuery; cb != nil {
+				var uid int64
+				if cb.From != nil {
+					uid = cb.From.ID
+				}
+				if !b.IsAllowed(uid) {
+					b.log.Warn("tg: callback от неавторизованного — игнор", "uid", uid)
+					b.AnswerCallback(ctx, cb.ID, "")
+					continue
+				}
+				var chatID int64
+				if cb.Message != nil {
+					chatID = cb.Message.Chat.ID
+				}
+				go cbFn(chatID, uid, cb.Data, cb.ID)
+				continue
+			}
 			msg := u.Message
 			if msg == nil {
 				continue
@@ -492,13 +575,13 @@ func (b *Bot) Run(ctx context.Context, updatesFn func(chatID, userID int64, text
 			}
 			// голосовое / аудио вложение → транскрипция в раннере
 			if att := voiceAttachmentOf(msg); att != nil {
-				go updatesFn(msg.Chat.ID, uid, "", att)
+				go msgFn(msg.Chat.ID, uid, "", att)
 				continue
 			}
 			if strings.TrimSpace(msg.Text) == "" {
 				continue // стикеры, фото и прочее — мимо
 			}
-			go updatesFn(msg.Chat.ID, uid, msg.Text, nil) // каждый апдейт — отдельная горутина
+			go msgFn(msg.Chat.ID, uid, msg.Text, nil) // каждый апдейт — отдельная горутина
 		}
 	}
 }

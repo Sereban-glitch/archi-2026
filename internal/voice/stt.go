@@ -24,11 +24,12 @@ import (
 	"github.com/archi/archi/internal/config"
 )
 
-// Transcriber — клиент STT.
+// Transcriber — клиент STT с опциональным фолбэком (второй провайдер той же формы).
 type Transcriber struct {
-	cfg  config.VoiceSTTConfig
-	log  *slog.Logger
-	http *http.Client
+	cfg      config.VoiceSTTConfig
+	log      *slog.Logger
+	http     *http.Client
+	fallback *Transcriber // основной упал (сеть/5xx/лимиты) — пробуем его
 }
 
 // NewTranscriber создаёт транскрайбер. cfg должен быть провалидирован (Enabled=true).
@@ -37,11 +38,15 @@ func NewTranscriber(cfg config.VoiceSTTConfig, log *slog.Logger) *Transcriber {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
-	return &Transcriber{
+	t := &Transcriber{
 		cfg:  cfg,
 		log:  log,
 		http: &http.Client{Timeout: timeout},
 	}
+	if cfg.Fallback != nil && cfg.Fallback.BaseURL != "" {
+		t.fallback = NewTranscriber(*cfg.Fallback, log)
+	}
+	return t
 }
 
 // Transcribe распознаёт речь в аудио-байтах. filename — исходное имя (важно
@@ -84,8 +89,19 @@ func (t *Transcriber) Transcribe(ctx context.Context, audio []byte, filename str
 		}
 		lastErr = err
 		if !retryable {
-			return "", err
+			break // 4xx от основного (битый ключ/лимит) — ретраи бессмысленны, но фолбэк-провайдер может принять
 		}
+	}
+
+	// Основной провайдер не ответил — пробуем резервный (обычно локальный whisper.cpp).
+	if t.fallback != nil {
+		t.log.Warn("voice: основной STT недоступен, переключаюсь на фолбэк", "err", lastErr,
+			"fallback_url", t.fallback.cfg.BaseURL)
+		text, ferr := t.fallback.Transcribe(ctx, audio, filename) // фолбэк сам решает про конверсию
+		if ferr == nil {
+			return text, nil
+		}
+		return "", fmt.Errorf("stt: основной: %v; фолбэк: %v", lastErr, ferr)
 	}
 	return "", fmt.Errorf("stt: исчерпаны попытки: %w", lastErr)
 }

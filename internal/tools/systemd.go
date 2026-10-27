@@ -30,7 +30,7 @@ func (r *Registry) registerSystemd() {
 	})
 	r.Register(&Tool{
 		Name: "systemd_restart",
-		Description: "Перезапустить systemd-сервис. РАЗРЕШЕНО только для: "+
+		Description: "Перезапустить systemd-сервис. РАЗРЕШЕНО только для: " +
 			strings.Join([]string{"console-bot", "agrobot", "info-bot", "archi"}, ", ") +
 			". На remote требует passwordless sudo (sudo -n). Используй осознанно.",
 		Timeout: 60 * time.Second,

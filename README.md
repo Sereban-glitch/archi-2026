@@ -189,10 +189,42 @@ archi/
 - RAM в простое: ~30–60 МБ (против 240 МБ MemoryMax у старого Node-бота).
 - Цикл телеметрии: раз в 30 с (настраивается), SSH-сессия ~1/цикл из пула.
 - Бинарник: ~8 МБ статик (CGO_ENABLED=0), старт < 100 мс.
+- Локальный whisper-фолбэк (если поднят archi-whisper.service): ~600 МБ в работе,
+  0 в простое при выключенном юните — фолбэк просто не сработает и вернётся ошибка основного провайдера.
+
+## Возможности 2026.12 «Автономность»
+
+- **Cron-задания** (`internal/cron`): агент сам просыпается по расписанию
+  (`every: 6h` или `times: ["09:05"]`), проходит полный ReAct-цикл в сессии
+  `cron:<name>`, отчитывается админам и пишет episode в память. Failure-nudge
+  ×3 с backoff 5m (паттерн Hermes Agent), `run_on_start` для пропущенных слотов.
+  Валидатор конфига ловит name/prompt/every+times/HH:MM.
+- **Approval-клавиатуры**: опасные команды (systemctl restart, rm -r, pkill,
+  chmod /etc, iptables, drop table, git push — список в `tools.approval_patterns`)
+  исполняются только после «✅ Разрешить» в Telegram. Нет ответа за
+  `approval_timeout` / Telegram выключен → отказ (fail-closed). Deny-набор
+  усилен (`--no-preserve-root`, `find / -delete`, `curl|sh`, `wget|bash`).
+- **Голосовой фолбэк STT**: Groq `whisper-large-v3-turbo` первичный →
+  локальный whisper.cpp (`archi-whisper.service`, модель small-q5_0)
+  автоматически при недоступности облака. Работает оффлайн.
+- **Usage-метрики**: `/status` и `archi ctl --status` показывают запросы и
+  токены in/out с старта демона.
+- **Аудит-фиксы 2026-10**: digest-слоты, ретраи 429/5xx у LLM, data race
+  SSH-пула, `history_limit`, сериализация ReAct-циклов сессии (TOCTOU
+  компактизации), UTF-8-безопасные усечения, компакция memory.jsonl,
+  symlink-защита writeAllowed, IPC-сессия `cli`.
+
+Подробности — HANDOFF.md.
 
 ## Что дальше (roadmap)
 
+- [x] ~~Проактивность: cron-задания~~ (2026.12)
+- [x] ~~Approval перед side-effects~~ (2026.12)
+- [x] ~~Usage-счётчики токенов~~ (2026.12)
 - [ ] `send_file` / `generate_photo` (Gemini) — перенос из старого бота.
 - [ ] Векторный recall вместо keyword-поиска (sqlite-vec или чистый Go).
+- [ ] Hands-free «Hey Archi»: Silero VAD + openWakeWord + ring-buffer
+      (archi-ear.service; CPU-бюджет ~5% ядра).
+- [ ] Локальный TTS Piper ru_RU для озвучки по умолчанию.
 - [ ] Webhook-режим Telegram как альтернатива polling.
 - [ ] Метрики в Prometheus text format на localhost:9101.

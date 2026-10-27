@@ -76,14 +76,32 @@ tools:
     - agrobot
     - info-bot
     - archi
+  # Жёсткий запрет — никогда не исполняется (жёсткий fail).
   bash_deny_patterns:
-    - 'rm\s+-rf\s+/(?:\s|$)'
+    - 'rm\s+-rf?\s+/(?:\s|$)'
     - 'mkfs'
     - 'dd\s+.*of=/dev/'
-    - ':\(\)\{.*\};:'
+    - ':\(\)\s*\{.*\};:'
     - 'shutdown|reboot|halt|poweroff'
     - '>\s*/dev/sd'
     - 'chmod\s+-R\s+777\s+/'
+    - '--no-preserve-root'
+    - 'find\s+/\s.*-delete'
+    - 'curl[^|]*\|\s*(ba)?sh\b'
+    - 'wget[^|]*\|\s*(ba)?sh\b'
+  # Опасное — спросить владельца в Telegram (✅/❌) перед исполнением.
+  # Нет ответа за approval_timeout = отказ (fail-closed).
+  approval_patterns:
+    - 'systemctl\s+(restart|stop|start|disable|enable|mask)'
+    - '\brm\s+-[a-zA-Z]*[rRf]'
+    - '\b(pkill|killall)\b'
+    - '\bkill\s+-?\d'
+    - '\bchmod\b.*\s/etc/'
+    - '\bchown\b.*\s/etc/'
+    - '\b(iptables|ufw)\b'
+    - '(?i)\bdrop\s+(table|database)\b'
+    - '\bgit\s+push\b'
+  approval_timeout: 2m
   forbidden_read_patterns:
     - '/etc/shadow'
     - '/etc/gshadow'
@@ -120,20 +138,29 @@ memory:
   recall_limit: 8
   max_entries: 5000
 
-# ---------- Голосовой интерфейс (2026.11) ----------
+# ---------- Голосовой интерфейс (2026.12) ----------
 # STT — OpenAI-совместимый POST {base_url}/audio/transcriptions (multipart).
-# Работает с: Groq (whisper-large-v3-turbo), OpenAI (whisper-1),
-# локальным whisper.cpp server / Speaches / LocalAI (base_url http://127.0.0.1:9000/v1).
+# Основной: Groq (быстро, дёшево). Фолбэк: локальный whisper.cpp на 127.0.0.1:9000 —
+# работает оффлайн (см. deploy/archi-whisper.service), включается автоматически,
+# когда основной недоступен (сеть/ключ/лимиты). Один клиент — любой провайдер.
 voice:
   stt:
-    enabled: false              # включи после настройки ключа
+    enabled: false              # включи после настройки ключа: voice.stt.enabled: true
     base_url: https://api.groq.com/openai/v1
     api_key: ${GROQ_API_KEY:-}   # для локального сервера можно оставить пустым
     model: whisper-large-v3-turbo
-    language: ru                # пусто = автоопределение
+    language: ru                # пусто = автоопределение (лучше для микса ru/ua/en)
     convert: auto               # auto|always|never — ogg→wav 16кГц для локальных серверов
     timeout: 60s
     max_bytes: 20971520         # 20 МБ (потолок Telegram Bot API)
+    # Резервный провайдер (обычно локальный whisper.cpp server).
+    # Отдельно задавать не обязательно: если archi-whisper.service не запущен,
+    # фолбэк просто не сработает и вернётся ошибка основного.
+    fallback:
+      base_url: http://127.0.0.1:9000
+      model: small-q5_0         # имя модели у whisper.cpp server
+      convert: auto             # localhost → сам сконвертирует в WAV 16кГц
+      timeout: 120s            # локальному на i5-6200U нужно 3-5x realtime
 
   # TTS — опциональная озвучка ответов (OpenAI-совместимый /audio/speech).
   # Формат opus → отправляется в Telegram как голосовое (sendVoice).
@@ -153,3 +180,26 @@ voice:
     device: default             # default | hw:0,0 | имя pulse-источника
     sample_rate: 16000         # то, что любит Whisper
     max_duration: 120s         # protect-таймер от забытой записи
+
+# ---------- Cron: проактивные задания агента (2026.12) ----------
+# Агент сам просыпается по расписанию и выполняет задачу через полный ReAct-цикл.
+# Результат приходит админам в Telegram + сохраняется в память как episode.
+# Рекомендуемые промпты уже содержат контекст — но подправь под свои сервисы.
+cron:
+  enabled: false               # включи, когда промпты устраивают
+  jobs:
+    - name: morning-check
+      times: ["09:05"]         # ежедневно в 09:05 (либо every: 6h — но не оба)
+      prompt: "Утренняя проверка: собери статус обеих нод (node_status), проверь services из алертов, кратко резюмируй аномалии и риски на сегодня. Если всё в норме — так и скажи, одной фразой."
+      timeout: 5m
+      notify: true
+    - name: disk-hygiene
+      every: 6h
+      prompt: "Проверь заполнение диска на обеих нодах и объём журналов journald. Если диск занят >80% — предложи план очистки (без исполнения деструктивного, только план)."
+      timeout: 5m
+      notify: false
+    - name: memory-review
+      times: ["21:30"]
+      prompt: "Вечерний обзор: прочитай недавние записи долговременной памяти (memory_recall 'инцидент'), выдели незакрытые темы/обещания и предложи список задач на завтра."
+      timeout: 5m
+      notify: true

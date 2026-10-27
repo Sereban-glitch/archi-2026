@@ -1,152 +1,162 @@
-# HANDOFF — Голосовой интерфейс Archi 2026 (2026.11)
+# HANDOFF — Archi 2026.12 «Автономность»
 
-Обновление добавляет голосовое общение с агентом: голосовые сообщения в Telegram
-и локальный микрофон ноутбука (`archi voice`). Сборка остаётся статическим
-бинарником без CGO; вся тяжёлая аудио-работа delegated внешним процессам
-(ffmpeg/arecord) и HTTP-провайдерам.
-
----
-
-## 1. Архитектурное решение (итоги разведки 2025–2026)
-
-### STT: OpenAI-совместимый HTTP-протокол вместо библиотек
-
-Рассмотренные варианты и почему выбран именно этот:
-
-| Вариант | Вердикт |
-|---|---|
-| Go-биндинги `whisper.cpp/bindings/go` | ❌ требуют CGO → рушат `CGO_ENABLED=0` статическую сборку и привносят C++ тулчейн в CI |
-| Python-обвязки (faster-whisper, pywhispercpp) | ❌ тяжёлый Python-монолит рядом с Go-бинарником — противоречит легковесности |
-| **OpenAI-совместимый `/v1/audio/transcriptions`** | ✅ один клиент — любой провайдер: Groq (`whisper-large-v3-turbo`), OpenAI (`whisper-1`), локальный whisper.cpp server / Speaches / LocalAI |
-
-Выбранный паттерн — **провайдер-агностика через стандартный протокол**:
-Groq даёт `whisper-large-v3-turbo` (быстрее и дешевле OpenAI, тот же API),
-локальный whisper.cpp поднимается отдельным юнитом `whisper-server` с
-OpenAI-совместимым endpoint — код агента не меняется при смене провайдера.
-
-### Telegram voice: OGG/Opus без перекодирования
-
-Telegram Voice — это OGG/Opus, который облачные Whisper-API принимают напрямую
-(до 20 МБ, лимит Bot API на скачивание). Перекодирование в WAV 16 кГц через
-внешний `ffmpeg` выполняется только для локальных серверов (`convert: auto`
-смотрит на host в base_url: localhost → конвертим, облако → шлём оригинал).
-Скачивание: `getFile` → `GET /file/bot<token>/<file_path>` с ретраями на
-сетевые сбои — тот же класс устойчивости, что у polling.
-
-### Микрофон: arecord + отдельная процессная группа
-
-`archi voice` пишет WAV 16 кГц моно через `arecord` (ALSA; в Mint PipeWire
-пробрасывается через pipewire-alsa) с авто-фолбэком на `ffmpeg -f alsa` и
-`parecord`. Ключевые детали надёжности:
-
-- рекордер в своей **процессной группе** — Ctrl+C в терминале не убивает его
-  мгновенно, а даёт нашему коду послать группе SIGINT → WAV-заголовок
-  корректно финализируется (иначе битый файл);
-- push-to-talk: Enter — стоп, protect-таймер 120 с обрывает забытую запись;
-- пустая/короткая запись (<1500 байт ≈ 47 мс) отбрасывается с понятной ошибкой.
-
-### TTS: опционально, `/audio/speech`
-
-Синтез включается флагом в конфиге; формат `opus` — именно OGG/Opus контейнер,
-который Telegram принимает как голосовое (`sendVoice`). Ответы длиннее
-`max_chars` не озвучиваются (пользователь получает текст). Локально озвучка
-ответа (`--speak`) играется через ffplay → paplay → aplay.
+Релиз закрывает топ-3 разрыва с эталонными агентами 2026 (аудит/разведка,
+см. §1) и всю критическую findings-часть аудита кода: **проактивность**
+(cron-задания), **интерактивные approval-клавиатуры** в Telegram,
+**голосовой фолбэк** на локальный whisper.cpp, плюс 4 P1-фикса и россыпь
+P2/P3. Сборка — по-прежнему статический бинарник без CGO (8.2 МБ).
 
 ---
 
-## 2. Что изменилось (файлы)
+## 1. Почему эти три модуля (выжимка GAP-анализа)
 
-### Новые
+Разведка OpenAI Operator/Realtime, Hermes Agent v0.22, OpenClaw 2.0,
+Claude Code, Pi/Goose/Amp/Codex показала 9 плоскостей отставания Archi.
+Топ-3 по соотношению «влияние на автономность / стоимость закрытия»:
 
-| Файл | Назначение |
-|---|---|
-| `internal/voice/stt.go` | Transcriber: multipart-клиент `/audio/transcriptions`, 3 ретрая (сеть/5xx), лимит размера, авто-конверсия ogg→wav |
-| `internal/voice/tts.go` | Synthesizer `/audio/speech` (nil-safe), `Play()` через ffplay/paplay/aplay, `PlainText()` — зачистка markdown перед озвучкой |
-| `internal/voice/mic.go` | `RecordInteractive` (push-to-talk), выбор бэкенда arecord/ffmpeg/parecord, сигналы процессной группе |
-| `internal/voice/ffmpeg.go` | `ConvertToWAV16k` (внешний ffmpeg), `safeName` (анти-инъекция multipart), `isLocalURL` |
-| `internal/voice/voice_test.go` | 8 тестов: мок-провайдеры, RIFF-проверка, авто-конверсия, 4xx, границы |
-| `internal/telegram/bot_test.go` | Мок Bot API: getFile+скачивание+sendVoice, нарезка UTF-8, нормализация вложений |
+1. **Проактивность** — Hermes cron (first-class agent tasks + failure-nudge ×3),
+   OpenClaw GatewayScheduler, Amp automations. Агент без расписания —
+   реактивный чат-бот: владелец остаётся единственным источником инициативы.
+2. **Approval перед side-effects** — Operator (подтверждение действий),
+   Claude Code (permission modes), Hermes (approval.py + write_approval
+   для памяти). Deny-regex один не масштабируется: он решето
+   (`rm -rf /home` проходил).
+3. **Observability** — счётчики токенов/запросов: без них LLM-агент
+   невозможно осознанно удешевлять.
 
-### Изменённые
+## 2. Что нового по модулям
 
-| Файл | Изменение |
-|---|---|
-| `internal/config/config.go` | Секция `voice:` (stt/tts/mic) + дефолты + валидация (base_url/model/convert/format/backend) |
-| `internal/telegram/bot.go` | `TgVoice`/`TgAudio` в Update; `GetFile`, `DownloadFileBytes` (ретраи), `DownloadAttachment`, `SendVoice` (multipart), `SendChatAction`; `SendMessage` теперь через `pollResponse` → ретраи ECONNRESET/429/409; роутинг voice/audio в `Run` |
-| `internal/telegram/runner.go` | `handleVoice`: скачивание → STT → цитата транскрипта + ответ агента; опциональный голосовой ответ TTS; /help упоминает голос |
-| `internal/ipc/cli.go` | `RunCLI` возвращает `(string, error)` — ответ нужен для `--speak` |
-| `cmd/archi/main.go` | Подкоманда `archi voice [--speak]`; сборка STT/TTS в `serve`; версия 2026.11.0 |
-| `deploy/config.yaml` | Секция `voice:` с комментариями (env-подстановка `${GROQ_API_KEY:-}`) |
+### 2.1. Cron-движок (`internal/cron`) — проактивность
 
-### Исправленные попутно дефекты
+- Расписание в config.yaml: `every: 6h` ИЛИ `times: ["09:05"]` (взаимоисключающи,
+  валидатор ловит нарушение; `every` < 1m запрещён).
+- Каждый запуск — полный ReAct-цикл агента в собственной сессии `cron:<name>`
+  (TTL и компактизация — как у всех сессий).
+- **Failure-nudge** как у Hermes: до 3 попыток с backoff 5m; после третьей —
+  алерт админам. Демон не останавливается.
+- Результат: админам в Telegram (`notify: true`) + episode в долговременную
+  память (_recall работает в будущих сессиях).
+- `run_on_start: true` — разовый прогон через минуту после старта (ноутбук
+  мог проспать слот).
+- `NextSlot()` смотрит слоты сегодня И завтра — тот же класс бага, что был
+  в digestLoop (P1-1), здесь исключён конструционно (тест `TestNextSlotDaily`).
+- Telegram выключен → результаты в лог (logNotifier), движок работает.
 
-1. **SendMessage терял сообщения** при ECONNRESET/429 — раньше одна попытка на
-   чанк; теперь полный retry-контур как у getUpdates.
-2. **runCtl не умел** передавать ответ вызывающему —signature расширена для TTS.
-3. **Проверка file_path** перед скачиванием (защита от `..` и инъекций схемы).
+### 2.2. Approval-клавиатуры (`tools/approval.go` + telegram) — доверие
 
----
+Трёхуровневая политика bash-инструментов, порядок строгий:
 
-## 3. Поток данных
+1. **deny-паттерны** (жёсткий отказ, без вопросов) — усилены аудитом:
+   `--no-preserve-root`, `find / … -delete`, `curl|sh`, `wget|bash`.
+2. **approval-паттерны** (спросить владельца) — рестарты systemd, `rm -r/-f`,
+   `pkill/killall/kill`, chmod/chown в `/etc`, iptables/ufw, `drop table/database`,
+   `git push`. Список настраивается, паттерны прекомпилированы.
+3. Остальное исполняется как раньше.
 
-```
-Telegram Voice (OGG/Opus ≤20МБ)
-  └→ bot.getFile + GET /file/bot… (ретраи) → байты
-      └→ Transcriber: облако? ── да ──→ multipart → /audio/transcriptions
-                    └─ нет (localhost) → ffmpeg → WAV16k → multipart
-          └→ {"text": …}
-              └→ agent.Handle (ReAct, те же инструменты/сессия tg:<chat>)
-                  └→ SendMessage ("🎙 «транскрипт» + ответ")
-                  └→ [TTS вкл.] /audio/speech → opus → bot.SendVoice
+Механика: `Registry.confirm()` → `Runner.Ask()` → inline-клавиатура
+«✅ Разрешить / ❌ Отклонить» первому админу. Кнопка → callback_query →
+канал решения → ответ LLM («ОТКЛОНЕНО ВЛАДЕЛЬЦЕМ…» либо исполнение).
+Клавиатура после решения снимается (editMessageText). **Fail-closed**:
+нет ответа за `approval_timeout` (2m) / Telegram выключен / канал умер →
+отказ. Одобренные команды пишутся в память (episode) — след аудита.
+Bot API: `allowed_updates` теперь `["message","callback_query"]`, добавлены
+`SendKeyboard/AnswerCallback/EditMessageText` (все через pollResponse —
+с теми же ECONNRESET-ретраями).
 
-archi voice [--speak]
-  └→ arecord/ffmpeg/parecord (pgid, Enter=стоп, ≤120с) → WAV16k
-      └→ Transcriber → транскрипт → IPC-сокет демона → ответ
-          └→ stdout; [ --speak ] TTS → ffplay/paplay/aplay
-```
+### 2.3. Голосовой фолбэк (`voice/stt.go` + `deploy/archi-whisper.service`)
 
----
+Эталонная схема звука на HP ProBook 440 G3 (i5-6200U 2C/4T, 12 ГБ):
 
-## 4. Проверка на ноутбуке (пошагово)
+- **Первичный** — Groq `whisper-large-v3-turbo` (~0.4-1.2 с, WER ru ~6-8%,
+  $0.04/час; free tier 1K req/день покрывает личное использование).
+- **Фолбэк** — локальный whisper.cpp server, модель `ggml-small-q5_0`
+  (RTF ~0.3-0.5 на этом CPU, ~600 МБ RAM, WER ru ~11-14%): поднимается
+  юнитом `archi-whisper.service` (CPUWeight=25, Nice=10, MemoryMax=1500M),
+  переключение автоматическое при недоступности основного (сеть/429/ключ).
+  Фолбэк сам решает конверсию OGG→WAV16k (convert: auto + localhost).
+- **voice_typer.service владельца НЕ трогаем**: его левые/правые Ctrl+Alt —
+  диктовка в сфокусированное окно; Archi — командование агентом
+  (Telegram-голос / `archi voice`). Разные роли, ноль конфликтов.
+
+### 2.4. P1-фиксы аудита (все 4)
+
+| # | Дефект | Файл | Фикс |
+|---|--------|------|------|
+| P1-1 | digestLoop пропускал завтрашний слот | telegram/runner.go | слоты ищутся сегодня+завтра |
+| P1-2 | 429/5xx не ретраились (мёртвая ветка) | agent/llm.go | `apiError.Status`; 429 и ≥500 ретраебельны, Retry-After работает |
+| P1-3 | data race на `SSHPool.fails` | bridge/ssh.go | чтение под локом |
+| P1-4 | `history_limit` не подключён | agent/session.go, agent.go | лимит сообщений истории в сессии |
+
+### 2.5. P2/P3-фиксы (выборка)
+
+- **TOCTOU compact()**: ReAct-циклы одной сессии сериализуются
+  (`Session.HandleMu`) — Telegram шлёт апдейты параллельными горутинами,
+  раньше compact мог потерять сообщения (тестами подтверждён класс бага).
+- **Eviction mid-run**: сессия с идущим циклом не вытесняется (busy-флаг).
+- **IPC-сессии**: все коннекты UNIX-сокета коллизировали в `"ipc:@"` —
+  теперь явная сессия `"cli"` (контекст `archi ctl` сохраняется).
+- **UTF-8**: усечения вывода инструментов и компактизации больше не рвут
+  руны (прямой скан границ; тест).
+- **Память**: memory.jsonl компактируется при переполнении (гистерезис ×1.2,
+  атомарный tmp+rename+fsync) — файл не растёт вечно, Recall видит всё окно.
+- **Deny-решето**: см. §2.2; **симлинки** в writeAllowed раскрываются
+  (EvalSymlinks) — `~/ln → /etc` не обманет префиксную проверку.
+- **forbidden_read** паттерны прекомпилированы (перекомпиляция на каждый
+  read_file убрана).
+- `stop_reason == "max_tokens"` → честное предупреждение в ответе.
+- TTS-озвучка использует родительский ctx (actx мог быть исчерпан ReAct-циклом).
+- Usage-счётчики: `/status` в Telegram и `archi ctl --status` показывают
+  запросы + токены in/out с старта демона.
+- Мёртвый код убран (поле `hints`, `&& false` в isRetryableNet).
+
+## 3. Конфигурация (deploy/config.yaml)
+
+Новые секции: `tools.approval_patterns` + `tools.approval_timeout`,
+`voice.stt.fallback` (полная форма провайдера), `cron.jobs[]`
+(3 готовых промпта: утренняя проверка, гигиена диска, вечерний обзор памяти).
+`cron.enabled: false` по умолчанию — включай после ревизии промптов.
+
+## 4. Установка на ноутбук (полный путь)
 
 ```bash
-# 0) зависимости (обычно уже есть в Mint)
-sudo apt install -y alsa-utils ffmpeg pulseaudio-utils
+git clone https://github.com/Sereban-glitch/archi-2026.git && cd archi-2026
+go vet ./... && go test ./...          # должны быть зелёными
+make build                             # bin/archi, CGO_ENABLED=0
 
-# 1) сборка и статический анализ
-go vet ./... && go test ./...          # 11 тестов, все PASS
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/archi ./cmd/archi
+sudo useradd -r -m archi 2>/dev/null || true
+sudo mkdir -p /etc/archi /var/lib/archi
+sudo cp deploy/config.yaml /etc/archi/
+sudo cp bin/archi /usr/local/bin/
+sudo cp deploy/archi.service deploy/archi-tunnel.service /etc/systemd/system/
+sudo systemctl daemon-reload
 
-# 2) конфиг: включи STT (Groq — самый быстрый старт)
-#    export GROQ_API_KEY=gsk_...      ← https://console.groq.com
-sed -i 's/^    enabled: false              # включи после настройки ключа/    enabled: true/' deploy/config.yaml
-archi check-config --config deploy/config.yaml   # → OK
+# секрета нет в git — задай окружение:
+sudo systemctl edit archi   # Environment=TELEGRAM_BOT_TOKEN=… GROQ_API_KEY=…
 
-# 3) Telegram: перезапусти демон и отправь боту голосовое сообщение
-sudo systemctl restart archi
-journalctl -u archi -f | grep voice    # → "voice: STT включён"
+# включить голос (фаза 0): /etc/archi/config.yaml → voice.stt.enabled: true
+sudo systemctl enable --now archi archi-tunnel
 
-# 4) Локальный микрофон
-archi voice --config deploy/config.yaml            # текстовый ответ
-archi voice --speak --config deploy/config.yaml    # + озвучка (нужен voice.tts.enabled)
-
-# 5) Локальный whisper.cpp вместо облака (опционально, приватность)
-#    ~/whisper.cpp/server -m models/ggml-base-q5_1.bin --port 9000 --host 127.0.0.1
-#    в config.yaml: voice.stt.base_url: http://127.0.0.1:9000/v1, api_key: ""
-#    convert: auto сам переключится на ogg→wav конверсию для localhost
+# (опционально, фаза 1) локальный фолбэк STT:
+#   инструкции в начале deploy/archi-whisper.service (сборка whisper.cpp,
+#   модель ggml-small-q5_0 184 МБ, юнит)
 ```
 
-Ожидаемое поведение при сбоях: недоступен STT-провайдер → в чат придёт
-«⚠️ Распознавание не удалось: …» (3 ретрая с backoff), сообщение не теряется;
-пустая транскрипция → подсказка перезаписать; голосовое при выключенном STT →
-«🎙 Голосовые сообщения отключены в конфиге».
+Проверка: `archi ctl --status`, `/status` в Telegram, голосовое сообщение
+боту, «перезапусти console-bot» → клавиатура ✅/❌.
 
-## 5. Ограничения и roadmap
+## 5. Совместимость и миграция
 
-- Whisper не видит форматирование: транскрипт идёт в агент как чистый текст —
-  это нормально для ReAct-запросов.
-- TTS-провайдеры: OpenAI `gpt-4o-mini-tts` / `tts-1`, Groq `playai-tts`
-  (голоса вида `Fritz-PlayAI`); локальный Piper — через LocalAI-совместимый шлюз.
-- push-to-talk, а не VAD: осознанный выбор для CLI (простота, предсказуемость);
-  roadmap — горячая клавиша и непрерывный VAD-режим.
-- Голосовые ответы Telegram шлются только на короткие ответы (≤ max_chars).
+- Конфиг 2026.11 совместим на 100%: новые секции имеют дефолты, старые
+  ключи не переименовывались. `check-config` валидирует всё новое.
+- `Bot.Run` сменил сигнатуру (добавлен callback-хендлер) — это внутренний
+  API, для внешних интеграций всё стабильно (IPC-протокол не менялся).
+- База памяти, сокет, пути — без изменений.
+
+## 6. Как проверялось
+
+- `go vet` чист; `go test ./...` — 19 тестов в 5 пакетах, все PASS
+  (новые: cron NextSlot ×3, deny-усиление ×2 набора, approval-паттерны ×2
+  набора, UTF-8 truncate ×2).
+- `check-config` — позитив (deploy-конфиг) и негатив (every+times вместе
+  ловится валидатором).
+- Статическая сборка CGO_ENABLED=0, 8.2 МБ, `archi version` → 2026.12.0.

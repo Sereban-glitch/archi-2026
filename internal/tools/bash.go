@@ -55,6 +55,14 @@ func (r *Registry) execBash(node string) func(context.Context, json.RawMessage) 
 			return fmt.Sprintf("ОШИБКА: команда отклонена санитайзером (паттерн %s). "+
 				"Деструктивные операции требуют человека.", bad), true
 		}
+		// Опасная команда (рестарты, rm, kill, push…) — спрашиваем владельца.
+		if pat := r.matchApproval(cmd); pat != "" {
+			ok, err := r.confirm(ctx, node, cmd, pat)
+			if err != nil || !ok {
+				return fmt.Sprintf("ОТКЛОНЕНО ВЛАДЕЛЬЦЕМ: команда не исполнена (причина: %v). "+
+					"Если задача реально требует этой команды — попроси владельца выполнить её вручную.", reason(err)), true
+			}
+		}
 		timeout := time.Duration(argInt(args, "timeout_sec", 120)) * time.Second
 		if timeout <= 0 || timeout > 5*time.Minute {
 			timeout = 5 * time.Minute
@@ -67,8 +75,26 @@ func (r *Registry) execBash(node string) func(context.Context, json.RawMessage) 
 	}
 }
 
+func reason(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return "владелец нажал «Отклонить»"
+}
+
+// matchDeny — первый сработавший deny-паттерн ("" если безопасно с точки зрения запрета).
 func (r *Registry) matchDeny(cmd string) string {
 	for _, re := range r.deny {
+		if re.MatchString(cmd) {
+			return re.String()
+		}
+	}
+	return ""
+}
+
+// matchApproval — первый сработавший approval-паттерн ("" = подтверждение не нужно).
+func (r *Registry) matchApproval(cmd string) string {
+	for _, re := range r.approval {
 		if re.MatchString(cmd) {
 			return re.String()
 		}

@@ -117,7 +117,11 @@ func (s *Server) Close() {
 // handleConn — одна клиентская сессия (line-delimited JSON, несколько запросов на соединение).
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
-	sessionID := "ipc:" + conn.RemoteAddr().String()
+	// У UNIX-сокетов RemoteAddr одинаков у всех коннектов (обычно "@"), поэтому
+	// раньше все CLI-клиенты коллизировали в одну сессию "ipc:@". Теперь у нас
+	// одна явная сессия "cli" для локального терминала: контекст `archi ctl`
+	// сохраняется между вызовами, а параллельные запросы сериализуются агентом.
+	sessionID := "cli"
 	defer func() {
 		if rec := recover(); rec != nil {
 			s.log.Error("ipc: паника обработчика", "panic", rec)
@@ -149,7 +153,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			continue
 		}
 		if req.Status {
-			writeJSON(conn, response{OK: true, Reply: statusJSON(s.bridge)})
+			writeJSON(conn, response{OK: true, Reply: statusJSON(s.bridge, s.agent)})
 			continue
 		}
 		if strings.TrimSpace(req.Text) == "" {
@@ -180,12 +184,17 @@ func writeJSON(conn net.Conn, r response) {
 }
 
 // statusJSON — компактный статус узлов для IPC-клиентов.
-func statusJSON(b *bridge.Bridge) string {
+func statusJSON(b *bridge.Bridge, ag *agent.Agent) string {
 	snap := b.Snapshot()
-	if snap == nil {
-		return "телеметрия ещё не собрана"
-	}
 	var sb strings.Builder
+	if ag != nil {
+		req, inT, outT := ag.UsageStats()
+		fmt.Fprintf(&sb, "llm: запросов %d, токенов in %d / out %d\n", req, inT, outT)
+	}
+	if snap == nil {
+		sb.WriteString("телеметрия ещё не собрана\n")
+		return sb.String()
+	}
 	for _, pair := range []struct {
 		t string
 		m *bridge.NodeMetrics

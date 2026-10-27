@@ -25,9 +25,9 @@ type Entry struct {
 // Слои по мотивам Hermes Agent (2026): рабочая память (Session), эпизодическая
 // (записи Episode), семантическая/навыки (skills-каталог, см. tools/knowledge).
 type Memory struct {
-	dir  string
+	dir   string
 	limit int
-	log  *slog.Logger
+	log   *slog.Logger
 
 	mu      sync.RWMutex
 	entries []Entry
@@ -77,6 +77,8 @@ func (m *Memory) load() {
 }
 
 // Save добавляет запись (пишется синхронно — память дороже скорости).
+// При выходе за лимит (×1.2 гистерезис) файл компактируется: переписывается
+// последними limit записями — иначе Recall молча «забывал» старое, а файл рос вечно.
 func (m *Memory) Save(kind, text string, tags ...string) error {
 	if strings.TrimSpace(text) == "" {
 		return nil
@@ -89,15 +91,60 @@ func (m *Memory) Save(kind, text string, tags ...string) error {
 	if err != nil {
 		return fmt.Errorf("memory append: %w", err)
 	}
-	defer f.Close()
 	line, _ := json.Marshal(e)
 	if _, err := f.Write(append(line, '\n')); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	m.entries = append(m.entries, e)
-	if len(m.entries) > m.limit {
-		m.entries = m.entries[len(m.entries)-m.limit:]
+	if m.limit > 0 && len(m.entries) > m.limit+m.limit/5 {
+		if err := m.compactLocked(); err != nil {
+			m.log.Warn("memory: компакция не удалась (попробую в следующий раз)", "err", err)
+		} else {
+			m.log.Info("memory: файл скомпактирован", "entries", len(m.entries))
+		}
 	}
+	return nil
+}
+
+// compactLocked переписывает memory.jsonl последними limit записями (под m.mu).
+func (m *Memory) compactLocked() error {
+	if m.limit <= 0 || len(m.entries) <= m.limit {
+		return nil
+	}
+	keep := append([]Entry(nil), m.entries[len(m.entries)-m.limit:]...)
+	tmp := m.file() + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
+	if err != nil {
+		return err
+	}
+	w := bufio.NewWriter(f)
+	for _, e := range keep {
+		line, _ := json.Marshal(e)
+		w.Write(line)
+		w.WriteByte('\n')
+	}
+	if err := w.Flush(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil { // это и есть fsync: power loss не съедает память
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, m.file()); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	m.entries = keep
 	return nil
 }
 
@@ -114,7 +161,7 @@ func (m *Memory) Recall(query string, k int) []Entry {
 	defer m.mu.RUnlock()
 
 	type scored struct {
-		e    Entry
+		e     Entry
 		score float64
 	}
 	var out []scored

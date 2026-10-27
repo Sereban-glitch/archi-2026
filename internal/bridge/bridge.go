@@ -20,17 +20,17 @@ type Bridge struct {
 	cfg      config.BridgeConfig
 	alertCfg config.AlertsConfig
 
-	local  Collector
-	remote Collector
+	local   Collector
+	remote  Collector
 	exec    *Executor
 	alerter *Alerter
 	log     *slog.Logger
 
-	snap    atomic.Pointer[Status]
+	snap     atomic.Pointer[Status]
 	remoteUp bool // предыдущее известное состояние удалённой ноды
 
-	mu       sync.Mutex
-	subs     []chan Event
+	mu        sync.Mutex
+	subs      []chan Event
 	restartAt map[string]time.Time // сервис → время последнего автоперезапуска
 }
 

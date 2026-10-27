@@ -52,6 +52,7 @@ type Config struct {
 	IPC      IPCConfig      `yaml:"ipc"`
 	Memory   MemoryConfig   `yaml:"memory"`
 	Voice    VoiceConfig    `yaml:"voice"`
+	Cron     CronConfig     `yaml:"cron"`
 }
 
 type LLMConfig struct {
@@ -112,8 +113,29 @@ type ToolsConfig struct {
 	MaxReadBytes          int      `yaml:"max_read_bytes"`
 	AllowedWriteDirs      []string `yaml:"allowed_write_dirs"`
 	AllowedRestart        []string `yaml:"allowed_restart_services"`
-	BashDenyPatterns      []string `yaml:"bash_deny_patterns"`
-	ForbiddenReadPatterns []string `yaml:"forbidden_read_patterns"`
+	BashDenyPatterns      []string `yaml:"bash_deny_patterns"`      // жёсткий запрет (без вопросов)
+	ForbiddenReadPatterns []string `yaml:"forbidden_read_patterns"` // секреты — не читать
+	ApprovalPatterns      []string `yaml:"approval_patterns"`       // спросить владельца перед исполнением
+	ApprovalTimeout       Duration `yaml:"approval_timeout"`        // сколько ждать ответа (потом = отказ)
+}
+
+// CronConfig — проактивные задания агента: расписание + промпт → ReAct-цикл.
+// Главный маркер автономности (паттерн Hermes cron / OpenClaw GatewayScheduler / Amp automations).
+type CronConfig struct {
+	Enabled bool      `yaml:"enabled"`
+	Jobs    []CronJob `yaml:"jobs"`
+}
+
+// CronJob — одно задание: либо every-интервал, либо ежедневные times-слоты.
+type CronJob struct {
+	Name       string   `yaml:"name"`         // уникальное имя (ид сессии: cron:<name>)
+	Enabled    *bool    `yaml:"enabled"`      // nil = true: наличие в списке = включено
+	Every      Duration `yaml:"every"`        // напр. 6h — запуск каждые N
+	Times      []string `yaml:"times"`        // напр. ["09:05"] — ежедневно в слот
+	Prompt     string   `yaml:"prompt"`       // что сказать агенту
+	Timeout    Duration `yaml:"timeout"`      // лимит одного запуска (default 10m)
+	RunOnStart bool     `yaml:"run_on_start"` // выполнить один раз при старте демона
+	Notify     bool     `yaml:"notify"`       // слать результат админам (default true)
 }
 
 type TelegramConfig struct {
@@ -151,15 +173,18 @@ type VoiceConfig struct {
 }
 
 // VoiceSTTConfig — распознавание речи (OpenAI-совместимый /audio/transcriptions).
+// Fallback — второй провайдер той же формы (обычно локальный whisper.cpp):
+// если основной упал (сеть/5xx/лимиты) — распознаём через него.
 type VoiceSTTConfig struct {
-	Enabled  bool     `yaml:"enabled"`
-	BaseURL  string   `yaml:"base_url"` // https://api.groq.com/openai/v1 | http://127.0.0.1:9000/v1
-	APIKey   string   `yaml:"api_key"`  // ${GROQ_API_KEY} / ${OPENAI_API_KEY}; пусто для локального сервера
-	Model    string   `yaml:"model"`    // whisper-large-v3-turbo (Groq) / whisper-1 (OpenAI)
-	Language string   `yaml:"language"` // подсказка языка: ru / en / "" = авто
-	Convert  string   `yaml:"convert"`  // auto|always|never — ogg/mp3 → wav 16кГц через ffmpeg
-	Timeout  Duration `yaml:"timeout"`
-	MaxBytes int64    `yaml:"max_bytes"` // лимит размера аудио
+	Enabled  bool            `yaml:"enabled"`
+	BaseURL  string          `yaml:"base_url"` // https://api.groq.com/openai/v1 | http://127.0.0.1:9000/v1
+	APIKey   string          `yaml:"api_key"`  // ${GROQ_API_KEY} / ${OPENAI_API_KEY}; пусто для локального сервера
+	Model    string          `yaml:"model"`    // whisper-large-v3-turbo (Groq) / whisper-1 (OpenAI)
+	Language string          `yaml:"language"` // подсказка языка: ru / en / "" = авто
+	Convert  string          `yaml:"convert"`  // auto|always|never — ogg/mp3 → wav 16кГц через ffmpeg
+	Timeout  Duration        `yaml:"timeout"`
+	MaxBytes int64           `yaml:"max_bytes"` // лимит размера аудио
+	Fallback *VoiceSTTConfig `yaml:"fallback"`  // резервный провайдер (optional)
 }
 
 // VoiceTTSConfig — синтез речи (OpenAI-совместимый /audio/speech), опционально.
@@ -318,9 +343,28 @@ func (c *Config) applyDefaults() {
 	}
 	if len(c.Tools.BashDenyPatterns) == 0 {
 		c.Tools.BashDenyPatterns = []string{
-			`rm\s+-rf\s+/(?:\s|$)`, `mkfs`, `dd\s+.*of=/dev/`, `:\(\)\{.*\};:`,
+			`rm\s+-rf?\s+/(?:\s|$)`, `mkfs`, `dd\s+.*of=/dev/`, `:\(\)\s*\{.*\};:`,
 			`shutdown|reboot|halt|poweroff`, `>\s*/dev/sd`, `chmod\s+-R\s+777\s+/`,
+			// усиление (аудит 2026-10): bare `rm -rf /` — не единственный путь снести систему
+			`--no-preserve-root`, `find\s+/\s.*-delete`,
+			`curl[^|]*\|\s*(ba)?sh\b`, `wget[^|]*\|\s*(ba)?sh\b`,
 		}
+	}
+	if len(c.Tools.ApprovalPatterns) == 0 {
+		c.Tools.ApprovalPatterns = []string{
+			`systemctl\s+(restart|stop|start|disable|enable|mask)`,
+			`\brm\s+-[a-zA-Z]*[rRf]`,
+			`\b(pkill|killall)\b`,
+			`\bkill\s+-?\d`,
+			`\bchmod\b.*\s/etc/`,
+			`\bchown\b.*\s/etc/`,
+			`\b(iptables|ufw)\b`,
+			`(?i)\bdrop\s+(table|database)\b`,
+			`\bgit\s+push\b`,
+		}
+	}
+	if c.Tools.ApprovalTimeout.Duration == 0 {
+		c.Tools.ApprovalTimeout.Duration = 2 * time.Minute
 	}
 	if len(c.Tools.ForbiddenReadPatterns) == 0 {
 		c.Tools.ForbiddenReadPatterns = []string{
@@ -351,17 +395,7 @@ func (c *Config) applyDefaults() {
 	}
 
 	// Голос: STT/TTS/микрофон.
-	c.Voice.STT.BaseURL = strings.TrimRight(strings.TrimSpace(c.Voice.STT.BaseURL), "/")
-	if c.Voice.STT.Convert == "" {
-		c.Voice.STT.Convert = "auto"
-	}
-	c.Voice.STT.Convert = strings.ToLower(c.Voice.STT.Convert)
-	if c.Voice.STT.Timeout.Duration == 0 {
-		c.Voice.STT.Timeout.Duration = 60 * time.Second
-	}
-	if c.Voice.STT.MaxBytes == 0 {
-		c.Voice.STT.MaxBytes = 20 << 20 // 20 МБ — лимит Bot API на скачивание
-	}
+	normalizeSTT(&c.Voice.STT)
 
 	c.Voice.TTS.BaseURL = strings.TrimRight(strings.TrimSpace(c.Voice.TTS.BaseURL), "/")
 	if c.Voice.TTS.Format == "" {
@@ -392,11 +426,41 @@ func (c *Config) applyDefaults() {
 		c.Voice.Mic.MaxDuration.Duration = 120 * time.Second
 	}
 
+	// Cron: проактивные задания.
+	for i := range c.Cron.Jobs {
+		j := &c.Cron.Jobs[i]
+		if j.Enabled == nil {
+			on := true // отсутствие ключа enabled в yaml = задание активно
+			j.Enabled = &on
+		}
+		if j.Timeout.Duration == 0 {
+			j.Timeout.Duration = 10 * time.Minute
+		}
+	}
+
 	// Разворачиваем ~ и делаем пути абсолютными.
 	c.Bridge.Remote.KeyPath = expandPath(c.Bridge.Remote.KeyPath)
 	c.Bridge.Remote.KnownHosts = expandPath(c.Bridge.Remote.KnownHosts)
 	c.DataDir = expandPath(c.DataDir)
 	c.Memory.Dir = expandPath(c.Memory.Dir)
+}
+
+// normalizeSTT — нормализация секции STT (используется и для fallback-а).
+func normalizeSTT(s *VoiceSTTConfig) {
+	s.BaseURL = strings.TrimRight(strings.TrimSpace(s.BaseURL), "/")
+	if s.Convert == "" {
+		s.Convert = "auto"
+	}
+	s.Convert = strings.ToLower(s.Convert)
+	if s.Timeout.Duration == 0 {
+		s.Timeout.Duration = 60 * time.Second
+	}
+	if s.MaxBytes == 0 {
+		s.MaxBytes = 20 << 20 // 20 МБ — лимит Bot API на скачивание
+	}
+	if s.Fallback != nil {
+		normalizeSTT(s.Fallback)
+	}
 }
 
 func expandPath(p string) string {
@@ -476,6 +540,39 @@ func (c *Config) Validate() []string {
 	case "auto", "arecord", "ffmpeg", "parecord":
 	default:
 		errs = append(errs, fmt.Sprintf("voice.mic.backend=%q — допустимо auto|arecord|ffmpeg|parecord", c.Voice.Mic.Backend))
+	}
+
+	// Cron-задания: имя, промпт и ровно один тип расписания.
+	names := make(map[string]bool)
+	for i, j := range c.Cron.Jobs {
+		if j.Name == "" {
+			errs = append(errs, fmt.Sprintf("cron.jobs[%d]: name обязателен", i))
+			continue
+		}
+		if names[j.Name] {
+			errs = append(errs, fmt.Sprintf("cron.jobs[%d]: дубликат имени %q", i, j.Name))
+		}
+		names[j.Name] = true
+		if strings.TrimSpace(j.Prompt) == "" {
+			errs = append(errs, fmt.Sprintf("cron.jobs[%d] (%s): prompt обязателен", i, j.Name))
+		}
+		hasEvery := j.Every.Duration > 0
+		hasTimes := len(j.Times) > 0
+		if !hasEvery && !hasTimes {
+			errs = append(errs, fmt.Sprintf("cron.jobs[%d] (%s): укажи every ИЛИ times", i, j.Name))
+		}
+		if hasEvery && hasTimes {
+			errs = append(errs, fmt.Sprintf("cron.jobs[%d] (%s): every и times взаимоисключающи", i, j.Name))
+		}
+		if hasEvery && j.Every.Duration < time.Minute {
+			errs = append(errs, fmt.Sprintf("cron.jobs[%d] (%s): every < 1m — слишком жарко для ноутбука", i, j.Name))
+		}
+		for _, t := range j.Times {
+			var h, m int
+			if _, err := fmt.Sscanf(t, "%d:%d", &h, &m); err != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+				errs = append(errs, fmt.Sprintf("cron.jobs[%d] (%s): время %q должно быть HH:MM", i, j.Name, t))
+			}
+		}
 	}
 	return errs
 }
