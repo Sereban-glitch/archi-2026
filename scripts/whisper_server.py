@@ -11,7 +11,7 @@ import logging
 import os
 import sys
 import tempfile
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 import cgi
 
 from faster_whisper import WhisperModel
@@ -105,13 +105,18 @@ class WhisperHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(response_data)
 
+        except (BrokenPipeError, ConnectionResetError):
+            logging.warning("Client disconnected before receiving transcription")
         except Exception as e:
             logging.exception("Transcription error")
-            err_msg = json.dumps({"error": str(e)}).encode("utf-8")
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(err_msg)
+            try:
+                err_msg = json.dumps({"error": str(e)}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(err_msg)
+            except Exception:
+                pass
 
     def log_message(self, format, *args):
         # Suppress verbose default access logs, keep clean
@@ -119,7 +124,7 @@ class WhisperHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    server = HTTPServer((HOST, PORT), WhisperHandler)
+    server = ThreadingHTTPServer((HOST, PORT), WhisperHandler)
     logging.info(f"Serving Whisper STT on http://{HOST}:{PORT}")
     try:
         server.serve_forever()
