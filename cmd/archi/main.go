@@ -5,6 +5,7 @@
 //	archi ctl --status    — быстрая сводка телеметрии
 //	archi ctl --reset     — сброс IPC-сессии
 //	archi voice [--speak] — голосовой запрос с микрофона ноутбука
+//	archi ptt [--no-beep]  — push-to-talk по хоткею: бип → фраза → ответ вслух
 //	archi check-config    — валидация config.yaml
 package main
 
@@ -16,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -35,7 +37,7 @@ import (
 	"github.com/archi/archi/internal/voice"
 )
 
-var version = "2026.15.0"
+var version = "2026.16.0"
 
 func main() {
 	if len(os.Args) > 1 {
@@ -58,6 +60,17 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "ptt":
+			if err := runPTT(os.Args[2:]); err != nil {
+				if errors.Is(err, voice.ErrPTTSignaled) {
+					// нажатие остановило живую сессию — это не сбой
+					fmt.Fprintln(os.Stderr, "archi-ptt: живая сессия остановлена повторным нажатием")
+					return
+				}
+				fmt.Fprintln(os.Stderr, "archi-ptt:", err)
+				os.Exit(1)
+			}
+			return
 		case "ear":
 			if err := runEarDaemon(os.Args[2:]); err != nil {
 				fmt.Fprintln(os.Stderr, "archi-ear:", err)
@@ -75,14 +88,32 @@ func main() {
 			return
 		}
 	}
-	fmt.Fprintf(os.Stderr, "Archi %s — гибридный DevOps-агент\n\nИспользование:\n  archi serve [--config config.yaml]\n  archi ctl \"текст\" [--config config.yaml]\n  archi voice [--speak] [--config config.yaml]\n  archi ear [--test|--train-wake] [--samples N] [--config config.yaml]\n      — hands-free слушатель (wake-word); --test — диагностика слуха\n  archi check-config [--config config.yaml]\n  archi version\n", version)
+	fmt.Fprintf(os.Stderr, "Archi %s — гибридный DevOps-агент\n\nИспользование:\n  archi serve [--config config.yaml]\n  archi ctl \"текст\" [--config config.yaml]\n  archi voice [--listen] [--speak] [--config config.yaml]\n  archi ptt [--no-beep] [--config config.yaml]\n      — push-to-talk по хоткею (Super+A, см. deploy/setup-hotkey.sh)\n  archi ear [--test|--train-wake] [--samples N] [--config config.yaml]\n      — hands-free слушатель (wake-word); --test — диагностика слуха\n  archi check-config [--config config.yaml]\n  archi version\n", version)
 	os.Exit(2)
+}
+
+// defaultCfgPath возвращает первый существующий путь: ~/.config/archi/config.yaml -> /etc/archi/config.yaml -> ./config.yaml
+func defaultCfgPath() string {
+	home, _ := os.UserHomeDir()
+	candidates := []string{
+		filepath.Join(home, ".config", "archi", "config.yaml"),
+		"/etc/archi/config.yaml",
+		"./config.yaml",
+	}
+	for _, c := range candidates {
+		if c != "" {
+			if _, err := os.Stat(c); err == nil {
+				return c
+			}
+		}
+	}
+	return "/etc/archi/config.yaml"
 }
 
 // flagsConfig парсит --config.
 func flagsConfig(args []string) (string, error) {
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
-	cfgPath := fs.String("config", "/etc/archi/config.yaml", "путь к config.yaml")
+	cfgPath := fs.String("config", defaultCfgPath(), "путь к config.yaml")
 	if err := fs.Parse(args); err != nil {
 		return "", err
 	}
@@ -318,9 +349,11 @@ func runCtl(args []string) error {
 
 // runVoice — archi voice: микрофон → STT → агент (через IPC) → ответ в консоль.
 // Флаг --speak озвучивает ответ через TTS (если включён в конфиге).
+// Флаг --listen — синоним `archi ptt` (2026.16): запись с VAD-автостопом
+// и озвучкой ответа, без Enter.
 func runVoice(args []string) error {
-	var speak bool
-	cfgPath := "/etc/archi/config.yaml"
+	var speak, listen bool
+	cfgPath := defaultCfgPath()
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -333,7 +366,18 @@ func runVoice(args []string) error {
 			cfgPath = strings.TrimPrefix(a, "--config=")
 		case a == "--speak":
 			speak = true
+		case a == "--listen":
+			listen = true
 		}
+	}
+	if listen {
+		rest := make([]string, 0, len(args))
+		for _, a := range args {
+			if a != "--listen" {
+				rest = append(rest, a)
+			}
+		}
+		return runPTT(rest)
 	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -390,6 +434,43 @@ func runVoice(args []string) error {
 	return nil
 }
 
+// runPTT — archi ptt: push-to-talk по хоткею (Super+A, см. deploy/setup-hotkey.sh)
+// или из терминала. Бип «слушаю» → запись с VAD-автостопом (или повторным
+// нажатием) → STT → агент в голосовом режиме → озвучка ответа.
+// Флаг --no-beep — без звуковых сигналов (отладка в терминале).
+func runPTT(args []string) error {
+	cfgPath := defaultCfgPath()
+	var noBeep bool
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--config" || a == "-config":
+			if i+1 < len(args) {
+				cfgPath = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(a, "--config="):
+			cfgPath = strings.TrimPrefix(a, "--config=")
+		case a == "--no-beep":
+			noBeep = true
+		}
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return err
+	}
+	if noBeep {
+		off := false
+		cfg.PTT.Beep = &off
+	}
+	// Текстовый логгер в stderr: stdout оставляем для диалога с пользователем.
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return voice.RunPTT(ctx, *cfg, log)
+}
+
 // runEarDaemon — archi ear: hands-free слушатель «Арчи, …» (отдельный процесс,
 // deploy/archi-ear.service). Слушает микрофон, ловит wake-word, шлёт команды
 // демону через IPC и озвучивает ответы (если включён TTS).
@@ -397,7 +478,7 @@ func runVoice(args []string) error {
 // --test       — диагностика слуха (захват → VAD → STT → wake → IPC) без демона.
 // --train-wake — записать шаблоны wake-word голосом владельца (для wake_engine: dtw).
 func runEarDaemon(args []string) error {
-	cfgPath := "/etc/archi/config.yaml"
+	cfgPath := defaultCfgPath()
 	var test, train bool
 	samples := 5
 	for i := 0; i < len(args); i++ {

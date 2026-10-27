@@ -11,7 +11,7 @@ ETCDIR   ?= /etc/archi
 
 LDFLAGS  := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build vet test clean install uninstall deploy deploy-ear check
+.PHONY: all build vet test clean install uninstall deploy deploy-ear hotkey check
 
 all: vet build
 
@@ -52,6 +52,11 @@ deploy-ear:
 	install -Dm644 deploy/archi-ear.service /etc/systemd/system/archi-ear.service
 	systemctl daemon-reload
 	@echo ">>> Включи в конфиге ear.enabled: true, затем: systemctl enable --now archi-ear"
+
+## hotkey: привязать Super+A к archi ptt в Cinnamon (2026.16 Push-To-Talk)
+hotkey:
+	bash deploy/setup-hotkey.sh
+	@echo ">>> Проверка: archi ptt --no-beep (в терминале), затем Super+A — с бипом"
 
 ## check: проверка конфига без запуска
 check:

@@ -55,6 +55,7 @@ type Config struct {
 	Skills        SkillsConfig        `yaml:"skills"`
 	Voice         VoiceConfig         `yaml:"voice"`
 	Ear           EarConfig           `yaml:"ear"`
+	PTT           PTTConfig           `yaml:"ptt"`
 	Browser       BrowserConfig       `yaml:"browser"`
 	Cron          CronConfig          `yaml:"cron"`
 	Observability ObservabilityConfig `yaml:"observability"`
@@ -227,6 +228,18 @@ type EarVADConfig struct {
 	MinSpeechMs int     `yaml:"min_speech_ms"` // короче — не фраза (шум/клик)
 	SilenceMs   int     `yaml:"silence_ms"`    // тишина в конце фразы
 	NoiseLearnS int     `yaml:"noise_learn_s"` // калибровка шума при старте (сек)
+}
+
+// PTTConfig — push-to-talk по хоткею (2026.16): archi ptt / archi voice --listen.
+// Бип → запись с микрофона (автостоп по хвосту тишины или повторному нажатию)
+// → STT → агент в голосовом режиме → озвучка. Привязка хоткея —
+// deploy/setup-hotkey.sh (Super+A в Cinnamon).
+type PTTConfig struct {
+	Beep            *bool    `yaml:"beep"`              // звуковые сигналы; nil = true
+	SilenceMs       int      `yaml:"silence_ms"`        // тишина после речи → автостоп записи
+	StartFactor     float64  `yaml:"start_factor"`      // чувствительность (кнопка = намерение: мягче ear)
+	NoSpeechTimeout Duration `yaml:"no_speech_timeout"` // нажали, но так и не заговорили
+	MaxUtterance    Duration `yaml:"max_utterance"`     // жёсткий потолок одной команды
 }
 
 // BrowserConfig — CDP-браузерный инструмент (текст страницы + скриншот).
@@ -629,6 +642,24 @@ func (c *Config) applyDefaults() {
 		c.Ear.VAD.NoiseLearnS = 2
 	}
 
+	// PTT: push-to-talk по хоткею (2026.16).
+	if c.PTT.Beep == nil {
+		on := true
+		c.PTT.Beep = &on
+	}
+	if c.PTT.SilenceMs == 0 {
+		c.PTT.SilenceMs = 800
+	}
+	if c.PTT.StartFactor == 0 {
+		c.PTT.StartFactor = 2.0 // мягче ear (3.2): кнопка = намерение, ложно-позитив лишь оттянет автостоп
+	}
+	if c.PTT.NoSpeechTimeout.Duration == 0 {
+		c.PTT.NoSpeechTimeout.Duration = 10 * time.Second
+	}
+	if c.PTT.MaxUtterance.Duration == 0 {
+		c.PTT.MaxUtterance.Duration = 20 * time.Second
+	}
+
 	// Браузер: CDP-инструмент.
 	if c.Browser.Headless == nil {
 		on := true
@@ -836,6 +867,20 @@ func (c *Config) Validate() []string {
 	}
 	if c.Ear.VAD.StartFactor > 0 && c.Ear.VAD.StopFactor > 0 && c.Ear.VAD.StartFactor <= c.Ear.VAD.StopFactor {
 		errs = append(errs, "ear.vad.start_factor должен быть больше stop_factor (гистерезис)")
+	}
+
+	// PTT: параметры записи по кнопке.
+	if c.PTT.SilenceMs != 0 && (c.PTT.SilenceMs < 200 || c.PTT.SilenceMs > 5000) {
+		errs = append(errs, "ptt.silence_ms вне диапазона 200..5000 мс (меньше — режет фразы, больше — медленный отклик)")
+	}
+	if c.PTT.StartFactor != 0 && c.PTT.StartFactor <= 1.2 {
+		errs = append(errs, "ptt.start_factor должен быть > 1.2 (иначе шум считается речью)")
+	}
+	if c.PTT.NoSpeechTimeout.Duration != 0 && c.PTT.NoSpeechTimeout.Duration < time.Second {
+		errs = append(errs, "ptt.no_speech_timeout < 1s — слишком рано сдаваться")
+	}
+	if c.PTT.MaxUtterance.Duration != 0 && c.PTT.MaxUtterance.Duration < 2*time.Second {
+		errs = append(errs, "ptt.max_utterance < 2s — слишком коротко для команды")
 	}
 
 	// Observability: адрес должен парситься.

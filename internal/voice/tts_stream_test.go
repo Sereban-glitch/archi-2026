@@ -40,8 +40,8 @@ func TestSynthesizeCommandMock(t *testing.T) {
 	cfg := config.VoiceTTSConfig{
 		Enabled:  true,
 		Provider: "command",
-		Format:  "mp3",
-		Command: config.TTSCommandConfig{Bin: bin},
+		Format:   "mp3",
+		Command:  config.TTSCommandConfig{Bin: bin},
 	}
 	s := NewSynthesizer(cfg, testLogger())
 	out, err := s.Synthesize(context.Background(), "привет, это тест 2.5 GiB")
