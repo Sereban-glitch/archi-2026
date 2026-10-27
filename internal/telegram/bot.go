@@ -145,10 +145,26 @@ func New(cfg config.TelegramConfig, log *slog.Logger) *Bot {
 }
 
 // IsAllowed — авторизован ли пользователь.
-func (b *Bot) IsAllowed(userID int64) bool { return b.allowed[userID] }
+// Если список allowed пуст, первый написавший пользователь автоматически
+// становится авторизованным владельцем и администратором бота.
+func (b *Bot) IsAllowed(userID int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.allowed) == 0 {
+		b.allowed[userID] = true
+		b.admins[userID] = true
+		b.log.Info("tg: первый пользователь автоматически авторизован как владелец/админ", "user_id", userID)
+		return true
+	}
+	return b.allowed[userID]
+}
 
 // IsAdmin — является ли админом.
-func (b *Bot) IsAdmin(userID int64) bool { return b.admins[userID] }
+func (b *Bot) IsAdmin(userID int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.admins[userID]
+}
 
 // pollResponse — сырой HTTP запрос к Bot API с ретраями на транспортных ошибках.
 func (b *Bot) pollResponse(ctx context.Context, method string, body any, maxRetries int) (json.RawMessage, error) {

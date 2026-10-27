@@ -497,9 +497,8 @@ func (c *Config) Validate() []string {
 	if c.Telegram.Enabled && c.Telegram.Token == "" {
 		errs = append(errs, "telegram.enabled=true, но telegram.token пуст")
 	}
-	if c.Telegram.Enabled && len(c.Telegram.Allowed) == 0 {
-		errs = append(errs, "telegram.allowed пуст — укажи хотя бы один Telegram user ID")
-	}
+	// Если telegram.allowed пуст, бот работает в режиме авто-регистрации (first-run):
+	// первый написавший пользователь автоматически становится хозяином и администратором.
 	if len(c.Telegram.Admins) == 0 {
 		c.Telegram.Admins = c.Telegram.Allowed
 	}
