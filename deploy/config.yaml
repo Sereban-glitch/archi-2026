@@ -1,0 +1,121 @@
+# ============================================================
+# Archi 2026 — конфигурация гибридного агента
+# Путь установки: /etc/archi/config.yaml
+# Переменные окружения: ${VAR} и ${VAR:-default} раскрываются во всём файле.
+# ============================================================
+
+node_name: laptop          # как этот узел виден в метриках
+timezone: Europe/Kyiv
+data_dir: /var/lib/archi
+log_level: info            # debug | info | warn | error
+
+# ---------- LLM (antigravity-claude-proxy на agrobot-prod, доступен через SSH-туннель) ----------
+llm:
+  base_url: http://127.0.0.1:18080   # туннель до 35.209.212.217:18080 (см. archi-tunnel.service)
+  api_key: local-proxy
+  model: claude-sonnet-4-5
+  max_tokens: 4096
+  timeout: 120s
+  max_retries: 4
+
+# ---------- Ядро ReAct ----------
+agent:
+  max_steps: 24                # защита от зацикливания
+  history_limit: 40
+  compact_after_chars: 150000  # порог компактизации истории
+  idle_session_ttl: 12h
+  backoff_base: 1s
+  backoff_max: 30s
+  max_tool_parallel: 4         # параллельные вызовы инструментов
+
+# ---------- Мост (телеметрия + SSH + watchdog) ----------
+bridge:
+  interval: 30s               # цикл сбора метрик
+  remote_timeout: 20s
+  command_timeout: 120s
+  max_output_bytes: 262144    # 256 KiB на команду
+
+  remote:
+    host: agrobot-prod         # alias из ~/.ssh/config (или IP 35.209.212.217)
+    user: archi
+    port: 22
+    key_path: ~/.ssh/id_ed25519
+    known_hosts: ~/.ssh/known_hosts
+    strict_host_key: true
+    pool_size: 3               # параллельные SSH-соединения
+    connect_timeout: 10s
+    keepalive_interval: 15s
+    max_retries: 3
+
+  watchdog:
+    auto_restart:              # сервисы на VM, рестартуемые автоматически
+      - console-bot
+    restart_cooldown: 5m
+
+# ---------- Пороги тревог ----------
+alerts:
+  ram_percent: 85
+  cpu_percent: 80
+  disk_percent: 90
+  cooldown: 10m
+  services:                    # мониторятся на ОБЕИХ нодах
+    - console-bot              # systemd-юнит старого бота на VM
+    - postgresql
+    - sshd
+
+# ---------- Инструменты (политики безопасности) ----------
+tools:
+  max_read_bytes: 262144
+  allowed_write_dirs:
+    - /home
+    - /tmp
+    - /var/lib/archi
+    - /srv
+  allowed_restart_services:
+    - console-bot
+    - agrobot
+    - info-bot
+    - archi
+  bash_deny_patterns:
+    - 'rm\s+-rf\s+/(?:\s|$)'
+    - 'mkfs'
+    - 'dd\s+.*of=/dev/'
+    - ':\(\)\{.*\};:'
+    - 'shutdown|reboot|halt|poweroff'
+    - '>\s*/dev/sd'
+    - 'chmod\s+-R\s+777\s+/'
+  forbidden_read_patterns:
+    - '/etc/shadow'
+    - '/etc/gshadow'
+    - '\.ssh/'
+    - 'id_rsa'
+    - 'id_ed25519'
+    - '\.pem$'
+    - '\.key$'
+    - 'credentials\.json$'
+
+# ---------- Telegram ----------
+telegram:
+  enabled: true
+  api_base: https://api.telegram.org
+  token: ${TELEGRAM_BOT_TOKEN}
+  allowed:                     # allowlist: только эти пользователи могут писать боту
+    - 000000000                # ← замени на свой Telegram user ID
+  admins:                      # получают тревоги и сводки
+    - 000000000
+  poll_timeout: 50s
+  digest:
+    enabled: true
+    times: ["09:00", "21:00"]  # утренняя и вечерняя сводки
+    chats: []                  # пусто = admins
+
+# ---------- Локальный IPC (UNIX-сокет для `archi ctl`) ----------
+ipc:
+  enabled: true
+  socket_path: /run/archi/archi.sock
+
+# ---------- Долговременная память ----------
+memory:
+  dir: /var/lib/archi/memory   # memory.jsonl + skills/
+  recall_limit: 8
+  max_entries: 5000

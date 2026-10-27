@@ -1,0 +1,62 @@
+# ============================================================
+# archi.service — systemd-юнит для ноутбука (Linux Mint 22.3)
+# Установка:
+#   sudo cp archi.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now archi
+# ============================================================
+
+[Unit]
+Description=Archi 2026 — гибридный DevOps-агент (bridge + ReAct + Telegram + IPC)
+Documentation=file:///home/archi/archi/README.md
+After=network-online.target archi-tunnel.service
+Wants=network-online.target
+Requires=archi-tunnel.service
+
+[Service]
+Type=simple
+User=archi
+Group=archi
+
+ExecStart=/usr/local/bin/archi serve --config /etc/archi/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Каталоги (RuntimeDirectory/StateDirectory создаются systemd-ом с нужными правами)
+RuntimeDirectory=archi
+StateDirectory=archi
+WorkingDirectory=/var/lib/archi
+
+# Рестарт-политика (отказоустойчивость)
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Ресурсы: ноутбук щедрый, но границы нужны
+MemoryMax=1G
+CPUWeight=80
+
+# Лимиты
+LimitNOFILE=65536
+TasksMax=256
+
+# Безопасность (минимальные привилегии)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/archi /run/archi
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+# Окружение (токен бота)
+EnvironmentFile=-/etc/archi/archi.env
+
+# Логи
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=archi
+
+[Install]
+WantedBy=multi-user.target
