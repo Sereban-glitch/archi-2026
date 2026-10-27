@@ -23,6 +23,18 @@ func RunCLI(socketPath, text string, reset, status bool) (string, error) {
 // RunCLIQuiet — то же без печати в stdout: для фоновых потребителей
 // (ear-демона, `archi voice`), где ответ уходит дальше по конвейеру.
 func RunCLIQuiet(socketPath, text string, reset, status bool) (string, error) {
+	return runCLI(socketPath, request{Text: text, Reset: reset, Status: status})
+}
+
+// RunCLIVoice — запрос в голосовом режиме (2026.15): агент отвечает коротко
+// и разговорно (ответ пойдёт в синтезатор и в уши), сессия — отдельная "ear",
+// чтобы голосовой диалог не смешивался с терминальным контекстом.
+func RunCLIVoice(socketPath, text string) (string, error) {
+	return runCLI(socketPath, request{Text: text, Voice: true})
+}
+
+// runCLI — общий путь клиента: JSON-строка → сокет → первый ответ.
+func runCLI(socketPath string, req request) (string, error) {
 	conn, err := net.DialTimeout("unix", socketPath, 3*time.Second)
 	if err != nil {
 		return "", fmt.Errorf("не подключиться к %s (archi запущен?): %w", socketPath, err)
@@ -30,7 +42,6 @@ func RunCLIQuiet(socketPath, text string, reset, status bool) (string, error) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Minute))
 
-	req := request{Text: text, Reset: reset, Status: status}
 	b, _ := json.Marshal(req)
 	if _, err := conn.Write(append(b, '\n')); err != nil {
 		return "", fmt.Errorf("отправка: %w", err)

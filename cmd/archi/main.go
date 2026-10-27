@@ -35,7 +35,7 @@ import (
 	"github.com/archi/archi/internal/voice"
 )
 
-var version = "2026.14.0"
+var version = "2026.15.0"
 
 func main() {
 	if len(os.Args) > 1 {
@@ -376,19 +376,15 @@ func runVoice(args []string) error {
 		return err
 	}
 
-	// 4) Опциональная озвучка ответа.
+	// 4) Опциональная озвучка ответа (потоковая: piper — raw-стрим в плеер).
 	if speak {
 		if !cfg.Voice.TTS.Enabled {
 			return errors.New("--speak: voice.tts.enabled=false в конфиге")
 		}
 		fmt.Println("🔊 Озвучиваю ответ…")
 		tts := voice.NewSynthesizer(cfg.Voice.TTS, log)
-		audio, err := tts.Synthesize(ctx, voice.PlainText(reply))
-		if err != nil {
+		if err := tts.Speak(ctx, reply); err != nil {
 			return fmt.Errorf("озвучка: %w", err)
-		}
-		if err := voice.Play(ctx, audio, "."+cfg.Voice.TTS.Format, log); err != nil {
-			return err
 		}
 	}
 	return nil

@@ -442,7 +442,9 @@ func recorderHints() string {
 		"deploy/archi-ear-user.service 3) пользователь в группе audio 4) archi ear --test"
 }
 
-// askAgent отправляет команду демону через IPC-сокет (с отменой по ctx).
+// askAgent отправляет команду демону через IPC-сокет в ГОЛОСОВОМ режиме
+// (2026.15): агент получает установку отвечать коротко и разговорно, сессия —
+// отдельная "ear" (не смешивается с терминальной "cli").
 func askAgent(ctx context.Context, socket, text string) (string, error) {
 	type res struct {
 		reply string
@@ -450,7 +452,7 @@ func askAgent(ctx context.Context, socket, text string) (string, error) {
 	}
 	ch := make(chan res, 1)
 	go func() {
-		reply, err := ipc.RunCLIQuiet(socket, text, false, false)
+		reply, err := ipc.RunCLIVoice(socket, text)
 		ch <- res{reply, err}
 	}()
 	select {
@@ -599,16 +601,10 @@ func runEarSession(ctx context.Context, cfg config.Config, engine string,
 		if tts == nil {
 			return
 		}
-		text = strings.TrimSpace(PlainText(text))
-		if text == "" {
-			return
-		}
 		go func() {
-			audio, err := tts.Synthesize(ctx, text)
-			if err != nil {
-				log.Warn("ear: TTS не справился (отвечаю молча)", "err", err)
-				return
-			}
+			// 2026.15: потоковая озвучка Speak — Piper гонит raw PCM
+			// прямо в плеер, первое предложение звучит раньше готовности
+			// всего текста; нормализация «под речь» внутри Speak.
 			playMu.Lock()
 			if ctx.Err() != nil {
 				playMu.Unlock()
@@ -617,8 +613,8 @@ func runEarSession(ctx context.Context, cfg config.Config, engine string,
 			playCtx, cancel := context.WithCancel(ctx)
 			playCancel = cancel
 			playMu.Unlock()
-			if err := Play(playCtx, audio, playExt(cfg.Voice.TTS.Format), log); err != nil {
-				log.Warn("ear: не проиграть ответ", "err", err)
+			if err := tts.Speak(playCtx, text); err != nil {
+				log.Warn("ear: озвучка не вышла (отвечаю молча)", "err", err)
 			}
 			playMu.Lock()
 			playCancel = nil
@@ -690,6 +686,7 @@ func runEarSession(ctx context.Context, cfg config.Config, engine string,
 
 			// Транскрипт нужен почти всегда: движок stt — для wake, остальные —
 			// для текста команды. Сбой STT не роняет локальные движки.
+			tSTT := time.Now()
 			transcript := ""
 			if stt != nil {
 				tr, err := stt.Transcribe(ctx, wrapWAV(pcm, rate), "ear.wav")
@@ -699,6 +696,7 @@ func runEarSession(ctx context.Context, cfg config.Config, engine string,
 					transcript = strings.TrimSpace(tr)
 				}
 			}
+			sttMs := time.Since(tSTT).Milliseconds()
 			if transcript != "" {
 				log.Debug("ear: услышал фразу", "transcript", clipE(transcript, 160))
 			}
@@ -762,13 +760,17 @@ func runEarSession(ctx context.Context, cfg config.Config, engine string,
 			}
 			armed = false
 
+			tLLM := time.Now()
 			reply, err := askAgent(ctx, cfg.IPC.SocketPath, command)
 			if err != nil {
 				log.Error("ear: демон не ответил", "err", err)
 				speak("Демон не отвечает. Проверь статус.")
 				continue
 			}
-			log.Info("ear: ответ", "reply", clipE(reply, 200))
+			// 2026.15: наблюдаемость задержки — видно, где живут секунды.
+			log.Info("ear: ответ", "reply", clipE(reply, 200),
+				"stt_ms", sttMs, "llm_ms", time.Since(tLLM).Milliseconds(),
+				"total_ms", time.Since(tSTT).Milliseconds())
 			speak(reply)
 		}
 	}

@@ -261,26 +261,43 @@ type VoiceSTTConfig struct {
 	Fallback *VoiceSTTConfig `yaml:"fallback"`  // резервный провайдер (optional)
 }
 
-// VoiceTTSConfig — синтез речи: provider openai (облако, /audio/speech) или
-// piper (локальный офлайн-синтез, внешний бинарь). Опционально.
+// VoiceTTSConfig — синтез речи: provider openai (облако, /audio/speech),
+// piper (локальный офлайн-синтез, внешний бинарь) или command (любой внешний
+// движок: текст → stdin, аудио → stdout; Edge-TTS, Silero…). Опционально.
 type VoiceTTSConfig struct {
-	Enabled  bool        `yaml:"enabled"`
-	Provider string      `yaml:"provider"` // openai | piper
-	BaseURL  string      `yaml:"base_url"` // https://api.openai.com/v1
-	APIKey   string      `yaml:"api_key"`  // ${OPENAI_API_KEY}
-	Model    string      `yaml:"model"`    // gpt-4o-mini-tts / tts-1 / playai-tts (Groq)
-	Voice    string      `yaml:"voice"`    // alloy (OpenAI) / Fritz-PlayAI (Groq)
-	Format   string      `yaml:"format"`   // opus (Telegram-friendly) | mp3 | wav
-	Timeout  Duration    `yaml:"timeout"`
-	MaxChars int         `yaml:"max_chars"` // длиннее — не озвучиваем, отвечаем текстом
-	Piper    PiperConfig `yaml:"piper"`
+	Enabled  bool             `yaml:"enabled"`
+	Provider string           `yaml:"provider"` // openai | piper | command
+	BaseURL  string           `yaml:"base_url"` // https://api.openai.com/v1
+	APIKey   string           `yaml:"api_key"`  // ${OPENAI_API_KEY}
+	Model    string           `yaml:"model"`    // gpt-4o-mini-tts / tts-1 / playai-tts (Groq)
+	Voice    string           `yaml:"voice"`    // alloy (OpenAI) / Fritz-PlayAI (Groq)
+	Format   string           `yaml:"format"`   // opus (Telegram-friendly) | mp3 | wav
+	Timeout  Duration         `yaml:"timeout"`
+	MaxChars int              `yaml:"max_chars"` // длиннее — не озвучиваем, отвечаем текстом
+	Piper    PiperConfig      `yaml:"piper"`
+	Command  TTSCommandConfig `yaml:"command"`
 }
 
 // PiperConfig — локальный нейро-синтез Piper (https://github.com/rhasspy/piper).
-// Голоса: https://huggingface.co/rhasspy/piper-voices (ru_RU: irina, dmitri, ruslan).
+// Голоса: https://huggingface.co/rhasspy/piper-voices (ru_RU: irina, ruslan,
+// dmitri, denis). Параметры «живого голоса» (2026.15): дефолты piper
+// (noise 0.667/0.8) дрожат и дребезжат на согласных — лечится настройкой.
 type PiperConfig struct {
-	Bin     string   `yaml:"bin"`   // путь к бинарю piper (ставит deploy/setup-piper.sh)
-	Model   string   `yaml:"model"` // .onnx-голос, напр. ru_RU-irina-medium.onnx
+	Bin         string   `yaml:"bin"`   // путь к бинарю piper (ставит deploy/setup-piper.sh)
+	Model       string   `yaml:"model"` // .onnx-голос, напр. ru_RU-ruslan-medium.onnx
+	Timeout     Duration `yaml:"timeout"`
+	NoiseScale  float64  `yaml:"noise_scale"`  // 0.333 — чистота (меньше = ровнее)
+	NoiseW      float64  `yaml:"noise_w"`      // 0.6 — дрожь питча (меньше = стабильнее)
+	LengthScale float64  `yaml:"length_scale"` // 0.95 — темп (меньше = бодрее)
+	SampleRate  int      `yaml:"sample_rate"`  // 0 = из .onnx.json голоса (фолбэк 22050)
+}
+
+// TTSCommandConfig — внешний TTS-движок-обёртка: текст на stdin, аудио на
+// stdout в формате voice.tts.format. Так подключается всё, что читает pipe:
+// Edge-TTS (deploy/edge-tts.sh), Silero, piper1-gpl, RHVoice.
+type TTSCommandConfig struct {
+	Bin     string   `yaml:"bin"`  // команда-обёртка
+	Args    []string `yaml:"args"` // её аргументы
 	Timeout Duration `yaml:"timeout"`
 }
 
@@ -547,10 +564,25 @@ func (c *Config) applyDefaults() {
 		c.Memory.Embeddings.Timeout.Duration = 15 * time.Second
 	}
 
-	// TTS: провайдер openai | piper.
+	// TTS: провайдер openai | piper | command.
 	c.Voice.TTS.Provider = strings.ToLower(strings.TrimSpace(c.Voice.TTS.Provider))
 	if c.Voice.TTS.Provider == "" {
 		c.Voice.TTS.Provider = "openai"
+	}
+
+	// Piper «живой голос» (2026.15): дефолты piper (0.667/0.8/1.0) дребезжат
+	// и дрожат на согласных — русские medium-голоса звучат живее с 0.333/0.6/0.95.
+	if c.Voice.TTS.Piper.NoiseScale == 0 {
+		c.Voice.TTS.Piper.NoiseScale = 0.333
+	}
+	if c.Voice.TTS.Piper.NoiseW == 0 {
+		c.Voice.TTS.Piper.NoiseW = 0.6
+	}
+	if c.Voice.TTS.Piper.LengthScale == 0 {
+		c.Voice.TTS.Piper.LengthScale = 0.95
+	}
+	if c.Voice.TTS.Command.Timeout.Duration == 0 {
+		c.Voice.TTS.Command.Timeout.Duration = 60 * time.Second
 	}
 	if c.Voice.TTS.Piper.Timeout.Duration == 0 {
 		c.Voice.TTS.Piper.Timeout.Duration = 30 * time.Second
@@ -766,13 +798,18 @@ func (c *Config) Validate() []string {
 
 	// TTS-провайдер.
 	switch c.Voice.TTS.Provider {
-	case "openai", "piper":
+	case "openai", "piper", "command":
 	default:
-		errs = append(errs, fmt.Sprintf("voice.tts.provider=%q — допустимо openai|piper", c.Voice.TTS.Provider))
+		errs = append(errs, fmt.Sprintf("voice.tts.provider=%q — допустимо openai|piper|command", c.Voice.TTS.Provider))
 	}
 	if c.Voice.TTS.Enabled && c.Voice.TTS.Provider == "piper" {
 		if c.Voice.TTS.Piper.Bin == "" || c.Voice.TTS.Piper.Model == "" {
 			errs = append(errs, "voice.tts.provider=piper — укажи piper.bin и piper.model (deploy/setup-piper.sh)")
+		}
+	}
+	if c.Voice.TTS.Enabled && c.Voice.TTS.Provider == "command" {
+		if c.Voice.TTS.Command.Bin == "" {
+			errs = append(errs, "voice.tts.provider=command — укажи command.bin (обёртка движка: текст stdin → аудио stdout, см. deploy/edge-tts.sh)")
 		}
 	}
 

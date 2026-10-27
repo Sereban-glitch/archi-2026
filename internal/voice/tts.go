@@ -1,10 +1,17 @@
-// tts.go — опциональный синтез речи (Text-to-Speech) через OpenAI-совместимый
-// POST {base_url}/audio/speech → бинарные аудио-данные.
+// tts.go — синтез речи (Text-to-Speech), релиз 2026.15 «Живой голос».
 //
-// Совместимые провайдеры: OpenAI (gpt-4o-mini-tts / tts-1), Groq (playai-tts).
-// Формат по умолчанию — opus (OGG/Opus): именно его ждёт Telegram sendVoice,
-// локально играется через ffplay. Ответы длиннее max_chars не озвучиваются —
-// пользователь получает их текстом.
+// Провайдеры:
+//   - piper   — локальный офлайн-синтез (бинарь + .onnx-голос, deploy/setup-piper.sh).
+//     Параметры живости (noise_scale/noise_w/length_scale) лечат дребезг
+//     и дрожь ruslan; ear озвучивает СТРИМОМ: Piper читает stdin построчно
+//     (одна фраза = строка) и гонит raw PCM прямо в плеер — первое слово
+//     звучит, пока синтезируются остальные.
+//   - command — любая внешняя команда: текст на stdin, аудио на stdout
+//     (Edge-TTS, Silero, piper1-gpl… см. deploy/edge-tts.sh).
+//   - прочее  — OpenAI-совместимый POST {base_url}/audio/speech (облако).
+//
+// Весь текст проходит NormalizeForSpeech: «2.56» → «2 и 56», «GiB» → «гигабайт»,
+// «76%» → «76 процентов», markdown/эмодзи/URL вычищаются.
 package voice
 
 import (
@@ -18,7 +25,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/archi/archi/internal/config"
@@ -29,6 +39,9 @@ type Synthesizer struct {
 	cfg  config.VoiceTTSConfig
 	log  *slog.Logger
 	http *http.Client
+
+	piperOnce sync.Once
+	piperRate int // частота дискретизации голоса (из .onnx.json), для raw-стрима
 }
 
 // NewSynthesizer создаёт синтезатор.
@@ -48,32 +61,194 @@ func (s *Synthesizer) MaxChars() int {
 	return s.cfg.MaxChars
 }
 
-// PlainText грубо убирает markdown-разметку из ответа агента перед озвучкой.
-// Точная разметка синтезатору не нужна — только чистый текст.
-func PlainText(s string) string {
-	return strings.NewReplacer("*", "", "`", "", "_", "", "#", "", ">", "").Replace(s)
-}
+// PlainText подгоняет ответ агента под озвучку.
+// С 2026.15 — полное развёртывание (числа, единицы, markdown): см. NormalizeForSpeech.
+func PlainText(s string) string { return NormalizeForSpeech(s) }
 
-// Synthesize превращает текст в аудио. Провайдер piper — локальный офлайн-синтез
-// (бинарь + .onnx-голос, см. deploy/setup-piper.sh), всё остальное —
-// OpenAI-совместимый /audio/speech (облако).
+// Synthesize превращает текст в аудио-байты. Текст нормализуется под речь
+// (идемпотентно — двойной вызов не портит результат).
 func (s *Synthesizer) Synthesize(ctx context.Context, text string) ([]byte, error) {
 	if s == nil {
 		return nil, errors.New("tts отключён")
 	}
-	if strings.EqualFold(strings.TrimSpace(s.cfg.Provider), "piper") {
-		return s.synthesizePiper(ctx, text)
-	}
-	return s.synthesizeHTTP(ctx, text)
-}
-
-// synthesizePiper — локальный синтез: текст на stdin бинарю, WAV в temp-файл,
-// затем конвертация под целевой формат (Telegram любит opus).
-func (s *Synthesizer) synthesizePiper(ctx context.Context, text string) ([]byte, error) {
-	text = strings.TrimSpace(text)
+	text = strings.TrimSpace(NormalizeForSpeech(text))
 	if text == "" {
 		return nil, errors.New("пустой текст")
 	}
+	provider := strings.ToLower(strings.TrimSpace(s.cfg.Provider))
+	switch provider {
+	case "piper":
+		return s.synthesizePiper(ctx, text)
+	case "command":
+		return s.synthesizeCommand(ctx, text)
+	default:
+		return s.synthesizeHTTP(ctx, text)
+	}
+}
+
+// Speak — озвучить текст вслух на ноутбуке с минимальной задержкой.
+// Piper: стриминг raw PCM в плеер (первая фраза звучит раньше готовности всего
+// текста). Остальные провайдеры: Synthesize → Play через temp-файл.
+func (s *Synthesizer) Speak(ctx context.Context, text string) error {
+	if s == nil {
+		return errors.New("tts отключён")
+	}
+	text = strings.TrimSpace(NormalizeForSpeech(text))
+	if text == "" {
+		return nil
+	}
+	if strings.EqualFold(strings.TrimSpace(s.cfg.Provider), "piper") && s.cfg.Piper.Bin != "" {
+		if err := s.speakPiperStream(ctx, text); err == nil {
+			return nil
+		} else {
+			s.log.Warn("tts: потоковая озвучка не вышла, откат на файловую", "err", err)
+		}
+	}
+	audio, err := s.Synthesize(ctx, text)
+	if err != nil {
+		return err
+	}
+	return Play(ctx, audio, playExt(s.cfg.Format), s.log)
+}
+
+// ---- piper ----
+
+// piperTuningArgs — флаги «живого голоса»: чистота против дребезга и темп.
+// Значения из конфига (дефолты задаёт applyDefaults: 0.333 / 0.6 / 0.95 —
+// сильная шумность piper 0.667/0.8 «дрожит» на согласных).
+func piperTuningArgs(p config.PiperConfig) []string {
+	var args []string
+	if p.NoiseScale != 0 {
+		args = append(args, "--noise_scale", strconv.FormatFloat(p.NoiseScale, 'f', -1, 64))
+	}
+	if p.NoiseW != 0 {
+		args = append(args, "--noise_w", strconv.FormatFloat(p.NoiseW, 'f', -1, 64))
+	}
+	if p.LengthScale != 0 {
+		args = append(args, "--length_scale", strconv.FormatFloat(p.LengthScale, 'f', -1, 64))
+	}
+	return args
+}
+
+// piperSampleRate — частота дискретизации голоса из .onnx.json (кэш на клиенте).
+// Стриминг --output_raw идёт без заголовков — частоту нужно знать заранее.
+func (s *Synthesizer) piperSampleRate() int {
+	s.piperOnce.Do(func() {
+		if s.cfg.Piper.SampleRate > 0 {
+			s.piperRate = s.cfg.Piper.SampleRate
+			return
+		}
+		s.piperRate = 22050 // все ru_RU-medium голоса piper — 22050; правим, если json скажет иное
+		if s.cfg.Piper.Model != "" {
+			raw, err := os.ReadFile(s.cfg.Piper.Model + ".json")
+			if err != nil {
+				return
+			}
+			var meta struct {
+				Audio struct {
+					SampleRate int `json:"sample_rate"`
+				} `json:"audio"`
+			}
+			if json.Unmarshal(raw, &meta) == nil && meta.Audio.SampleRate > 0 {
+				s.piperRate = meta.Audio.SampleRate
+			}
+		}
+	})
+	return s.piperRate
+}
+
+// speakPiperStream — потоковая озвучка: piper (stdin: фразы построчно,
+// stdout: raw s16le PCM) | плеер (ffplay/aplay/pacat). Два процесса в своих
+// группах: отмена ctx гасит оба (barge-in). Прерывания игрока рвут pipe —
+// piper добивается SIGPIPE и не висит.
+func (s *Synthesizer) speakPiperStream(ctx context.Context, text string) error {
+	rate := s.piperSampleRate()
+
+	timeout := s.cfg.Piper.Timeout.Duration
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	cctx, cancel := context.WithTimeout(ctx, 2*timeout) // стрим длинного текста — длиннее одиночного синтеза
+	defer cancel()
+
+	piper := exec.CommandContext(cctx, s.cfg.Piper.Bin,
+		append([]string{"--model", s.cfg.Piper.Model, "--output_raw"}, piperTuningArgs(s.cfg.Piper)...)...)
+	piper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	piper.Stdin = strings.NewReader(strings.Join(SpeechChunks(text, 200), "\n"))
+	var perr bytes.Buffer
+	piper.Stderr = &perr
+
+	pout, err := piper.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("piper stdout: %w", err)
+	}
+	if err := piper.Start(); err != nil {
+		return fmt.Errorf("piper старт: %w", err)
+	}
+
+	type playerCmd struct {
+		bin  string
+		args []string
+	}
+	var candidates []playerCmd
+	if p, err := lookCommand("ffplay"); err == nil {
+		candidates = append(candidates, playerCmd{p, []string{
+			"-autoexit", "-nodisp", "-loglevel", "quiet",
+			"-f", "s16le", "-ar", strconv.Itoa(rate), "-ac", "1", "-"}})
+	}
+	if p, err := lookCommand("pacat"); err == nil { // PipeWire/Pulse-сессия (юнит пользователя)
+		candidates = append(candidates, playerCmd{p, []string{
+			"--playback", "--raw",
+			"--rate", strconv.Itoa(rate), "--format=s16le", "--channels=1"}})
+	}
+	if p, err := lookCommand("aplay"); err == nil {
+		candidates = append(candidates, playerCmd{p, []string{
+			"-q", "-f", "S16_LE", "-r", strconv.Itoa(rate), "-c", "1", "-"}})
+	}
+	if len(candidates) == 0 {
+		_ = syscall.Kill(-piper.Process.Pid, syscall.SIGKILL)
+		_, _ = piper.Process.Wait()
+		return errors.New("нет плеера для raw-стрима (ffplay/pacat/aplay)")
+	}
+
+	var playErr error
+	for _, pl := range candidates {
+		player := exec.CommandContext(cctx, pl.bin, pl.args...)
+		player.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		player.Stdin = pout
+		var lerr bytes.Buffer
+		player.Stderr = &lerr
+		if err := player.Start(); err != nil {
+			playErr = fmt.Errorf("плеер %s: %w", pl.bin, err)
+			continue // плеер не стартовал — пайп цел, пробуем следующий
+		}
+		// Оба процесса живы: ждём piper (источник), затем игрока.
+		perrWait := piper.Wait()
+		playerErr := player.Wait()
+		switch {
+		case playerErr == nil:
+			return perrWait // доиграло — ошибка piper существеннее молчания о ней
+		case cctx.Err() != nil:
+			return perrWait // нас отменили (barge-in) — это не поломка стрима
+		default:
+			// Плеер сдох на середине потока: аудио потеряно, пайп пуст —
+			// следующий плеер нечего читать; честно отдаём ошибку наверх,
+			// ear откатится на файловый путь озвучки.
+			if msg := strings.TrimSpace(perr.String()); msg != "" {
+				s.log.Warn("tts: piper stderr при сбое плеера", "msg", clipE(msg, 200))
+			}
+			return fmt.Errorf("плеер %s: %w%s", pl.bin, playerErr, suffixMsg(clipB(lerr.Bytes(), 200)))
+		}
+	}
+	if playErr != nil {
+		return playErr
+	}
+	return errors.New("tts: ни один плеер не стартовал")
+}
+
+// synthesizePiper — локальный синтез в файл: текст на stdin бинарю, WAV в temp-файл,
+// затем конвертация под целевой формат (Telegram любит opus).
+func (s *Synthesizer) synthesizePiper(ctx context.Context, text string) ([]byte, error) {
 	timeout := s.cfg.Piper.Timeout.Duration
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -87,7 +262,8 @@ func (s *Synthesizer) synthesizePiper(ctx context.Context, text string) ([]byte,
 	}
 	defer removeTemp(tmp)
 
-	cmd := exec.CommandContext(cctx, s.cfg.Piper.Bin, "--model", s.cfg.Piper.Model, "--output_file", tmp)
+	args := append([]string{"--model", s.cfg.Piper.Model, "--output_file", tmp}, piperTuningArgs(s.cfg.Piper)...)
+	cmd := exec.CommandContext(cctx, s.cfg.Piper.Bin, args...)
 	cmd.Stdin = strings.NewReader(text)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -112,6 +288,37 @@ func (s *Synthesizer) synthesizePiper(ctx context.Context, text string) ([]byte,
 		return wav, nil
 	}
 	return out, nil
+}
+
+// ---- command-провайдер: любой внешний движок ----
+
+// synthesizeCommand — внешний TTS: текст на stdin, аудио-байты с stdout.
+// Формат обязан соответствовать voice.tts.format (opus/mp3/wav…).
+// Так подключаются Edge-TTS (deploy/edge-tts.sh), Silero, piper1-gpl и всё,
+// что умеет читать pipe — без вендорлока на проприетарные протоколы.
+func (s *Synthesizer) synthesizeCommand(ctx context.Context, text string) ([]byte, error) {
+	if s.cfg.Command.Bin == "" {
+		return nil, errors.New("tts command: не задан bin (voice.tts.command.bin)")
+	}
+	timeout := s.cfg.Command.Timeout.Duration
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(cctx, s.cfg.Command.Bin, s.cfg.Command.Args...)
+	cmd.Stdin = strings.NewReader(text)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("tts command %s: %w%s", s.cfg.Command.Bin, err, suffixMsg(clipB(stderr.Bytes(), 200)))
+	}
+	if stdout.Len() == 0 {
+		return nil, errors.New("tts command: пустой stdout")
+	}
+	return stdout.Bytes(), nil
 }
 
 // ffmpegConvertAudio конвертирует аудио-байты в целевой формат через ffmpeg.
@@ -158,13 +365,6 @@ func ffmpegConvertAudio(ctx context.Context, audio []byte, ext string) ([]byte, 
 
 // synthesizeHTTP — облачный синтез через OpenAI-совместимый /audio/speech.
 func (s *Synthesizer) synthesizeHTTP(ctx context.Context, text string) ([]byte, error) {
-	if s == nil {
-		return nil, errors.New("tts отключён")
-	}
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return nil, errors.New("пустой текст")
-	}
 	if s.cfg.MaxChars > 0 {
 		r := []rune(text)
 		if len(r) > s.cfg.MaxChars {
@@ -218,7 +418,7 @@ func (s *Synthesizer) synthesizeHTTP(ctx context.Context, text string) ([]byte, 
 }
 
 // Play воспроизводит аудио-байты на ноутбуке: ffplay (ffmpeg) → paplay → aplay.
-// Используется командой `archi voice --speak`.
+// Используется командой `archi voice --speak` и файловым fallback озвучки ear.
 func Play(ctx context.Context, audio []byte, ext string, log *slog.Logger) error {
 	tmp, err := writeTemp(audio, ext)
 	if err != nil {

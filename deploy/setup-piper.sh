@@ -10,6 +10,10 @@
 #   sudo bash deploy/setup-piper.sh          — голос irina (medium, ~63 МБ)
 #   sudo bash deploy/setup-piper.sh ruslan   — мужской голос (medium)
 #   sudo bash deploy/setup-piper.sh dmitri   — мужской голос (medium)
+#   sudo bash deploy/setup-piper.sh denis    — мужской голос (medium)
+#
+# «Живой голос» (2026.15): против дрожи/дребезга piper в конфиге задаются
+#   noise_scale: 0.333, noise_w: 0.6, length_scale: 0.95 (см. deploy/config.yaml).
 #
 # После установки в конфиге:
 #   voice:
@@ -34,8 +38,8 @@ MODEL_URL="$HF/ru/ru_RU-$VOICE-medium/1.0/ru_RU-$VOICE-medium.onnx"
 MODEL_JSON_URL="$HF/ru/ru_RU-$VOICE-medium/1.0/ru_RU-$VOICE-medium.onnx.json"
 
 case "$VOICE" in
-  irina|ruslan|dmitri) ;;
-  *) echo "Неизвестный голос: $VOICE (доступны: irina, ruslan, dmitri)"; exit 1 ;;
+  irina|ruslan|dmitri|denis) ;;
+  *) echo "Неизвестный голос: $VOICE (доступны: irina, ruslan, dmitri, denis)"; exit 1 ;;
 esac
 
 mkdir -p "$DEST"
@@ -53,6 +57,7 @@ curl -fSL --retry 3 -o "$DEST/ru_RU-$VOICE-medium.onnx.json" "$MODEL_JSON_URL"
 echo ">>> Проверка синтеза…"
 echo "Проверка голоса" | "$DEST/piper" \
   --model "$DEST/ru_RU-$VOICE-medium.onnx" \
+  --noise_scale 0.333 --noise_w 0.6 --length_scale 0.95 \
   --output_file /tmp/piper-test.wav
 rm -f /tmp/piper-test.wav
 
@@ -70,6 +75,11 @@ voice:
       bin: $DEST/piper
       model: $DEST/ru_RU-$VOICE-medium.onnx
       timeout: 30s
+      noise_scale: 0.333      # «Живой голос»: ровнее, без дребезга
+      noise_w: 0.6            # без дрожи на согласных
+      length_scale: 0.95      # бодрый темп
 
->>> Голос сменить: sudo bash deploy/setup-piper.sh ruslan
+>>> Голос сменить: sudo bash deploy/setup-piper.sh denis
+>>> Не нравится piper вообще? — provider: command + deploy/edge-tts.sh
+    (облачный Edge-TTS Дмитрия: естественнее, нужен интернет)
 EOF

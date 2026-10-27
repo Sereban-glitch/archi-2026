@@ -75,6 +75,12 @@ func (a *Agent) UsageStats() (req, inT, outT int64) {
 // Циклы одной сессии сериализуются (Telegram шлёт апдейты параллельными горутинами):
 // это устраняет гонку compact() против параллельных Append (TOCTOU, аудит 2026-10).
 func (a *Agent) Handle(ctx context.Context, sessionID, userText string) (string, error) {
+	return a.HandleOpts(ctx, sessionID, userText, HandleOpts{})
+}
+
+// HandleOpts — параметры обработки запроса (расширение Handle без ломки
+// совместимости: Telegram/крони зовут Handle).
+func (a *Agent) HandleOpts(ctx context.Context, sessionID, userText string, opts HandleOpts) (string, error) {
 	s := a.sessions.Get(sessionID)
 
 	s.SetBusy()
@@ -87,7 +93,7 @@ func (a *Agent) Handle(ctx context.Context, sessionID, userText string) (string,
 	if s.Chars() > a.cfg.CompactAfter {
 		a.compact(ctx, s)
 	}
-	reply, err := a.reactLoop(ctx, s)
+	reply, err := a.reactLoop(ctx, s, opts)
 	if err != nil {
 		// Graceful fallback: возвращаем лучший частичный результат, а не пустоту.
 		if last := s.LastText(); last != "" {
@@ -98,8 +104,13 @@ func (a *Agent) Handle(ctx context.Context, sessionID, userText string) (string,
 	return reply, nil
 }
 
+// HandleOpts — режим обработки: голосовой (ear) меняет стиль ответа.
+type HandleOpts struct {
+	Voice bool // ответ уйдёт в синтезатор и в уши владельцу: коротко, разговорно, без markdown
+}
+
 // reactLoop — сердце агента: цикл LLM → tool_use → tool_result → … до текста.
-func (a *Agent) reactLoop(ctx context.Context, s *Session) (string, error) {
+func (a *Agent) reactLoop(ctx context.Context, s *Session, opts HandleOpts) (string, error) {
 	defs := a.tools.Definitions()
 	query := lastUserQuery(s)
 	memHints := a.mem.Recall(query, a.memLimit())
@@ -116,6 +127,9 @@ func (a *Agent) reactLoop(ctx context.Context, s *Session) (string, error) {
 		}
 
 		system := BuildSystemPrompt(a.tz, a.snap(), memHints, sklHints)
+		if opts.Voice {
+			system += VoiceStyleGuide()
+		}
 		resp, err := a.llm.SendMessage(ctx, system, s.History(), defs)
 		if err != nil {
 			return "", fmt.Errorf("шаг %d: %w", step, err)

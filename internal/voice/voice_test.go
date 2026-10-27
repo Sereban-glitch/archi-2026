@@ -52,8 +52,9 @@ func TestIsLocalURL(t *testing.T) {
 }
 
 func TestPlainText(t *testing.T) {
+	// 2026.15: PlainText = NormalizeForSpeech (полная нормализация под речь)
 	in := "*жирный* и `код` с #заголовком\n> цитата _и_ **вложенный**"
-	want := "жирный и код с заголовком\n цитата и вложенный"
+	want := "жирный и код с заголовком\nцитата и вложенный"
 	if got := PlainText(in); got != want {
 		t.Errorf("PlainText = %q, хочу %q", got, want)
 	}

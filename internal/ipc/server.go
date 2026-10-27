@@ -46,6 +46,7 @@ type request struct {
 	Text   string `json:"text"`
 	Reset  bool   `json:"reset,omitempty"`
 	Status bool   `json:"status,omitempty"`
+	Voice  bool   `json:"voice,omitempty"` // голосовой режим (ear): короткий разговорный ответ без markdown
 }
 
 // response — строка ответа.
@@ -117,11 +118,9 @@ func (s *Server) Close() {
 // handleConn — одна клиентская сессия (line-delimited JSON, несколько запросов на соединение).
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
-	// У UNIX-сокетов RemoteAddr одинаков у всех коннектов (обычно "@"), поэтому
-	// раньше все CLI-клиенты коллизировали в одну сессию "ipc:@". Теперь у нас
-	// одна явная сессия "cli" для локального терминала: контекст `archi ctl`
-	// сохраняется между вызовами, а параллельные запросы сериализуются агентом.
-	sessionID := "cli"
+	// Сессия выбирается на каждый запрос: "cli" для терминала, "ear" для
+	// голосового режима (контекст `archi ctl` сохраняется между вызовами,
+	// параллельные запросы сериализуются агентом).
 	defer func() {
 		if rec := recover(); rec != nil {
 			s.log.Error("ipc: паника обработчика", "panic", rec)
@@ -146,6 +145,12 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			writeJSON(conn, response{OK: false, Error: "битый JSON: " + err.Error()})
 			continue
 		}
+		// Голосовой режим (ear, 2026.15) — отдельная сессия: разговорный
+		// контекст не смешивается с терминальным `archi ctl`.
+		sessionID := "cli"
+		if req.Voice {
+			sessionID = "ear"
+		}
 		// микро-команды
 		if req.Reset {
 			s.agent.Sessions().Reset(sessionID)
@@ -160,9 +165,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			writeJSON(conn, response{OK: false, Error: "пустой текст"})
 			continue
 		}
-		// основной путь: агент
+		// основной путь: агент (голосовой режим — с разговорным промптом)
 		actx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-		reply, err := s.agent.Handle(actx, sessionID, req.Text)
+		reply, err := s.agent.HandleOpts(actx, sessionID, req.Text, agent.HandleOpts{Voice: req.Voice})
 		cancel()
 		if err != nil {
 			s.log.Error("ipc: ошибка агента", "err", err)

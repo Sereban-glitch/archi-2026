@@ -206,12 +206,17 @@ voice:
     max_duration: 120s         # protect-таймер от забытой записи
 
   # TTS — опциональная озвучка ответов.
-  # Провайдер openai (облако, /audio/speech) или piper (локальный офлайн,
-  # ставится скриптом deploy/setup-piper.sh; голоса: irina / ruslan / dmitri).
+  # Провайдеры: openai (облако, /audio/speech), piper (локальный офлайн,
+  # ставится скриптом deploy/setup-piper.sh; голоса: irina / ruslan / dmitri / denis)
+  # или command (любой внешний движок: текст → stdin, аудио → stdout;
+  # напр. Edge-TTS — см. deploy/edge-tts.sh).
   # Формат opus → отправляется в Telegram как голосовое (sendVoice).
+  # Весь текст перед синтезом нормализуется под речь (2026.15 «Живой голос»):
+  # «2.56» → «2 и 56», «GiB» → «гигабайт», «76%» → «76 процентов»,
+  # markdown/эмодзи/URL вычищаются.
   tts:
     enabled: false
-    provider: openai            # openai | piper
+    provider: openai            # openai | piper | command
     base_url: https://api.openai.com/v1
     api_key: ${OPENAI_API_KEY:-}
     model: gpt-4o-mini-tts
@@ -223,6 +228,19 @@ voice:
       bin: /opt/piper/piper
       model: /opt/piper/ru_RU-irina-medium.onnx
       timeout: 30s
+      # «Живой голос» (2026.15): дефолты piper (0.667/0.8/1.0) дрожат и дребезжат
+      # на согласных — эти значения делают речь ровной и бодрой:
+      noise_scale: 0.333        # чистота: меньше = ровнее (0.1..0.66)
+      noise_w: 0.6              # дрожь питча: меньше = стабильнее
+      length_scale: 0.95        # темп: меньше = быстрее (0.8 = торопыга)
+      # sample_rate: 22050       # 0/не задан = из .onnx.json голоса (обычно 22050)
+      # Голос сменить: sudo bash deploy/setup-piper.sh ruslan   (или dmitri/denis/irina)
+      # В ear озвучка идёт ПОТОКОМ: piper --output_raw сразу в плеер —
+      # первое предложение звучит, пока синтезируются остальные.
+    # command:                  # используется только при provider: command
+    #   bin: /usr/local/bin/edge-tts-archi   # deploy/edge-tts.sh (pip install edge-tts)
+    #   args: []
+    #   timeout: 60s
 
 # ---------- Ear: hands-free голос (2026.13) ----------
 # Отдельный слушатель `archi ear` (deploy/archi-ear.service): ловит «Арчи, …»
@@ -249,7 +267,8 @@ ear:
     start_factor: 3.2          # RMS > пол×фактор → речь началась
     stop_factor: 1.9           # RMS < пол×фактор → тишина
     min_speech_ms: 320          # короче — клик/шум, не фраза
-    silence_ms: 1100            # тишина, закрывающая фразу
+    silence_ms: 800             # тишина, закрывающая фразу (800 — резвее отклик;
+                                #  если Агент перебивает вас на паузах — верните 1100)
     noise_learn_s: 2            # калибровка шума при старте (сек)
 
 # ---------- Cron: проактивные задания агента (2026.12) ----------

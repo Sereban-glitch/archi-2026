@@ -221,7 +221,9 @@ func (r *Runner) replyWithAgent(ctx context.Context, chatID int64, text, echo st
 		if max := r.tts.MaxChars(); max > 0 && len([]rune(reply)) > max {
 			return // длинные простыни не озвучиваем — читаем глазами
 		}
-		audio, err := r.tts.Synthesize(ctx, voice.PlainText(reply))
+		// Нормализация «под речь» (числа/единицы/markdown) происходит
+		// внутри Synthesize — 2026.15 «Живой голос».
+		audio, err := r.tts.Synthesize(ctx, reply)
 		if err != nil {
 			r.log.Warn("tg: TTS не озвучил ответ", "err", err)
 			return

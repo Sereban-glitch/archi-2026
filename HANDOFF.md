@@ -1,3 +1,64 @@
+# HANDOFF — Archi 2026.15 «Живой голос»
+
+Релиз по пользовательскому фидбеку на озвучку 2026.14: дребезг Piper, чтение
+знаков препинания и чисел буквально, админские простыни в голос и задержка.
+Ниже — что добавлено к 2026.14; далее прежний handoff без изменений.
+
+---
+
+## 0. Что в 2026.15 (кратко)
+
+| Модуль | Где | Что делает |
+|---|---|---|
+| Нормализация речи | `internal/voice/normalize.go` | «2.56»→«2 и 56», GiB→«гигабайт», %→«процентов», markdown/эмодзи/URL вычищаются; фразы для стриминга `SpeechChunks` |
+| Параметры Piper | `voice/tts.go` (`piperTuningArgs`), `config.go` | noise_scale 0.333 / noise_w 0.6 / length_scale 0.95 — дефолты, против дребезга и дрожи |
+| Потоковая озвучка | `voice/tts.go` (`Speak`) | piper `--output_raw` → плеер напрямую (ffplay/pacat/aplay): первое предложение звучит до готовности всего текста; частота из .onnx.json |
+| Разговорный режим ear | `agent/prompt.go` (`VoiceStyleGuide`), `ipc` (флаг `voice`), `ear.go` | агент отвечает 1–2 предложения живым языком без markdown; сессия `ear` отделена от `cli` |
+| Провайдер command | `voice/tts.go` (`synthesizeCommand`) | любой внешний TTS: текст→stdin, аудио→stdout; готовая обёртка Edge-TTS `deploy/edge-tts.sh` |
+| Тайминги ear | `ear.go` | журнал: `stt_ms / llm_ms / total_ms` — видно, где живут секунды |
+
+### 0.1. Разговорный режим — как включён
+
+`archi ear` шлёт IPC-запрос с `"voice":true` → сервер маршрутизирует в сессию
+`ear` и зовёт `agent.HandleOpts(..., Voice: true)` → к системному промпту
+дописывается «РЕЖИМ УШЕЙ» (кратко, разговорно, числа словами, без разметки).
+Протокол обратно совместим: старые клиенты без поля `voice` работают как раньше.
+
+### 0.2. Латентность ear (замер после релиза)
+
+```
+тишина 800ms → STT ~400ms → LLM ~0.8s (короткий голосовой ответ)
+→ piper первая фраза ~150ms → ЗВУК; итого ≈1.4–1.8s (в 2026.14 было ~2.8s)
+```
+
+### 0.3. Смена голоса/движка (по фидбеку «голос неживой»)
+
+```bash
+sudo bash deploy/setup-piper.sh denis     # четвёртый русский голос piper
+# параметры живости уже в config.yaml (noise_scale 0.333 / noise_w 0.6 / length_scale 0.95)
+# если piper не нравится совсем — облачный Edge-TTS (естественнее всех):
+sudo pip install --upgrade edge-tts
+sudo install -m 755 deploy/edge-tts.sh /usr/local/bin/edge-tts-archi
+# в конфиге: voice.tts.provider: command, voice.tts.format: mp3,
+#            voice.tts.command.bin: /usr/local/bin/edge-tts-archi
+```
+
+### 0.4. Прочие движки (разведка октябрь 2026)
+
+- **Silero v5** — лучший офлайн-русский, CC BY-NC-SA (личное ок), тот же контракт command;
+- **piper1-gpl** (OHF) — живой форк piper, бинарная замена;
+- **Kokoro-82M** — русского нет; **edge-tts** — жив, требует свежих версий пакета.
+
+---
+
+## 1. Прежний handoff — 2026.14 «Уши» (без изменений)
+
+Релиз про офлайн-wake-word и фикс «не слышит»: MFCC+DTW-движок (`archi ear
+--train-wake`), диагностика `archi ear --test`, движки stt|dtw|http|both,
+фиксы PipeWire-глухоты сервисом (XDG_RUNTIME_DIR, юнит пользователя).
+
+---
+
 # HANDOFF — Archi 2026.13 «Эталон 2026»
 
 Turnkey-релиз: все фиксы аудита + все модули, закрывающие GAP к эталонным
